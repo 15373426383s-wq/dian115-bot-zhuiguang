@@ -1,0 +1,15 @@
+{
+  "schema_version":3,"id":"bot.zhuiguang","name":"追光","version":"1.0.0","author":"bot",
+  "description":"豆瓣影视与 Bangumi 新番追新，固定 Emby 实例、120 条订阅上限与持久停订保护。",
+  "requires":{"api":"3.5"},"icon":"ui/icon.svg","ui":{"entry":"ui/page.js"},"menu":{"title":"追光","order":44},
+  "jobs":[
+    {"id":"browse","title":"发现与媒体匹配","entry":"jobs/browse.js","recover":"recover","queue":false,"timeout_seconds":180,"allow_overlap":false},
+    {"id":"engine","title":"追新订阅与核对","entry":"jobs/engine.js","recover":"recover","interval_seconds":300,"timeout_seconds":1800,"allow_overlap":false}
+  ],
+  "declared_usage":{
+    "apis":["GET /api/subscribe/pool/intents","GET /api/subscribe/pool/intents/{id}","POST /api/subscribe/pool/intents","DELETE /api/subscribe/pool/intents/{id}","GET /api/plugin-host/emby/instances","GET /api/plugin-host/emby/episodes","GET /api/plugin-host/emby/items","GET /api/tmdb/search","GET /api/tmdb/movie/{id}","GET /api/tmdb/tv/{id}","GET /api/extensions/v3/{id}/storage/{key}","PUT /api/extensions/v3/{id}/storage/{key}","GET /api/extensions/v3/{id}/network-capabilities"],
+    "sites":["https://movie.douban.com：公开热门电影/剧集列表、建议搜索、作品详情，不登录","https://api.bgm.tv：公开放送日历、动画搜索、作品详情，不登录","海报图片来自 https://*.doubanio.com、https://lain.bgm.tv、https://image.tmdb.org；来源链接仅由用户点击打开"],
+    "files":[],"notifications":false,
+    "risk":"默认关闭自动订阅，用户选择固定且非零 Emby 实例后启用。创建宿主聚合订阅会触发宿主已配置来源的搜索和转存。最多管理120条占用中的订阅（含提交中和未知结果）；已完成及确认删除的记录不占用。宿主确认404或用户停止订阅后持久停订，同一媒体跨来源不自动重建，手动恢复方可解除。结果未知先核对，不自动重发。外部目录使用快照查询并标注获取时间，不冒充时间增量；资源搜索与转存交给宿主，无插件全量缓存扫描。用户在页面停止订阅会删除对应宿主订阅，不删除媒体文件。数据仅存插件KV；停用/卸载由宿主取消任务，卸载清除默认数据，已创建宿主订阅不撤销。"
+  }
+}
