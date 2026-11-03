@@ -44,7 +44,7 @@ async function discover(ctx,pool,{force=false}={}){
   let cursor=start,occ=occupied(s),handled=new Set(Object.values(s.records).flatMap(r=>r.sourceKeys));
   await ctx.task.update({total:works.length,done,failed,message:'读取最新公开目录，核对固定媒体库'});
   for(let offset=0;offset<works.length;offset++){
-    const index=(start+offset)%works.length,raw=works[index],feed=raw.source==='bangumi'?'bangumi':`douban-${raw.mediaType}`,sk=sourceKey(raw);
+    const index=(start+offset)%works.length,raw=works[index],feed=raw.feed||(raw.source==='bangumi'?'bangumi':`douban-${raw.mediaType}`),sk=sourceKey(raw);
     cursor=(index+1)%Math.max(1,works.length);
     if(inspected>=24||Date.now()-started>6*60*1000)break;
     if(!c.auto||occ>=LIMIT)break;
@@ -52,7 +52,8 @@ async function discover(ctx,pool,{force=false}={}){
     if(isBlocked(s,raw)||handled.has(sk)){done++;continue;}
     try{
       // Cheap score/keyword checks are only an optimization; full detail supplies year and vote count.
-      if(raw.score<c.minScore){done++;continue;}
+      // 即将上映的片单没有评分（恒为 0），必须绕过这里的预筛选，否则整条片单永远进不了 eligible()。
+      if(feed!=='douban-soon'&&raw.score<c.minScore){done++;continue;}
       inspected++;const work=await loadDetail(ctx,raw);
       if(eligible(work,c)){
         const choice=await automaticMatch(ctx,work);

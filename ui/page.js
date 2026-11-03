@@ -10,6 +10,7 @@ const STATUS_NAMES = {prepared:'待提交',submitting:'正在提交',unknown:'�
 const HOST_NAMES = {pending:'等待资源',searching:'搜索资源',transferring:'转存中',partial:'部分入库',caught_up:'已追平',landed:'已入库',failed:'等待处理',expired:'已结束'};
 const DEFAULT_CONFIG = ()=>({proxyId:null,proxyName:'',auto:false,intervalMinutes:60,feeds:{'douban-tv':true,'douban-movie':true,'douban-soon':true,bangumi:true},minScore:7,minVotes:0,yearFrom:new Date().getFullYear(),include:'',exclude:'',pageCount:2,minWish:5000,soonWindowDays:30});
 const INITIAL_STATE = ()=>({version:1,records:{},blocks:{},catalog:{},review:{},logs:[],lastSync:0,lastAuto:0});
+const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
 
 function el(tag, props, children){
   const n = document.createElement(tag);
@@ -47,7 +48,7 @@ export async function mount(root, ctx){
     for(let i=0;i<8;i++){
       const cur = await apiGet(key, fallback);
       const out = fn(cur.value);
-      try{ await ctx.api.put(`/api/extensions/v3/${encodeURIComponent(pid)}/storage/${encodeURIComponent(key)}`, {value:cur.value, expected_revision:cur.revision}); return out; }
+      try{ await ctx.api.put(`/api/extensions/v3/${encodeURIComponent(pid)}/storage/${encodeURIComponent(key)}`, {value:out, expected_revision:cur.revision}); return out; }
       catch(e){ if(!/409/.test(String(e&&(e.status||e.response&&e.response.status)))) throw e; }
     }
     throw new Error('保存遇到并发冲突，请刷新后重试');
@@ -55,7 +56,9 @@ export async function mount(root, ctx){
 
   // ---- 任务 ----
   async function runTask(jobId, input, runId){
-    let task = await ctx.tasks.run(jobId, input, runId || `${jobId}:${input&&input.action||'run'}:${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    // 宿主签名是 tasks.run(job, business_key, input)：第二参是稳定业务键，第三参才是任务载荷。
+    const key = runId || `${jobId}:${input&&input.action||'run'}:${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    let task = await ctx.tasks.run(jobId, key, input);
     const wait = (ms)=>new Promise(r=>setTimeout(r,ms));
     for(let guard=0; guard<600 && !disposed; guard++){
       if(['succeeded','failed','cancelled','attention_required'].includes(task.status)) break;
@@ -68,26 +71,47 @@ export async function mount(root, ctx){
   }
 
   // ---- 封面代理（统一走宿主，并发受限，避免防盗链导致“图片显示不全”也避免打爆宿主） ----
-  const _imgQueue = []; let _imgInflight = 0; const _imgCache = new Map();
+  const _imgCache = new Map();   // url -> dataUrl | null
+  const _imgWait = new Map();    // url -> [apply...]（同一地址的重渲染复用一次请求）
+  const _imgQueue = []; let _imgActive = 0; const IMG_CONC = 6;
+  // 所有封面都必须经过队列：直接并发请求会被宿主代理限流成 400，表现就是“图片显示不全”。
   function enqueueCover(url, apply){
-    if(!url) return;
-    if(_imgCache.has(url)){ apply(_imgCache.get(url)); return; }
-    _imgQueue.push({url, apply, sig:++_imgSeen});
-    pumpCovers();
+    if(!url || disposed) return;
+    if(_imgCache.has(url)){ const hit=_imgCache.get(url); if(hit) apply(hit); return; }
+    if(_imgWait.has(url)){ _imgWait.get(url).push(apply); return; }
+    _imgWait.set(url, [apply]); _imgQueue.push(url); pumpCovers();
   }
-  let _imgSeen = 0;
   function pumpCovers(){
-    while(_imgInflight < 6 && _imgQueue.length){
-      const job = _imgQueue.shift(); _imgInflight++;
-      doProxy(job.url).then(d=>{ _imgCache.set(job.url, d); }).finally(()=>{ _imgInflight--; pumpCovers(); });
+    while(_imgActive < IMG_CONC && _imgQueue.length){
+      const url = _imgQueue.shift(); _imgActive++;
+      doProxy(url).then(d=>{
+        _imgCache.set(url, d);
+        const waiting = _imgWait.get(url) || []; _imgWait.delete(url);
+        if(!disposed) waiting.forEach(fn=>{ try{ fn(d); }catch(e){} });
+      }).finally(()=>{ _imgActive--; pumpCovers(); });
     }
   }
-  async function doProxy(url){
-    try{
-      const r = await ctx.http.request({url, headers:{Referer: url.includes('doubanio.com')?'https://movie.douban.com/':'https://bgm.tv/','User-Agent':'Mozilla/5.0'}, response_type:'base64', timeout_seconds:15, max_bytes:1024*1024, cache_seconds:86400, session:'public-covers'});
-      const ct = pickContentType(r);
-      if(r.status===200 && /^image\//.test(ct) && r.body_base64) return `data:${ct};base64,${r.body_base64}`;
-    }catch(e){}
+  // 后端给的是大图（Bangumi images.large / 豆瓣 l_ratio_poster），单张常超宿主代理上限而整批失败。
+  // 卡片尺寸只需要中图，降级后体积降到几十分之一，既快又不会触发 max_bytes。
+  function shrinkCover(url){
+    if(!url) return url;
+    return String(url)
+      .replace('/pic/cover/l/', '/pic/cover/c/')
+      .replace('/view/photo/l_ratio_poster/', '/view/photo/m_ratio_poster/')
+      .replace('/view/photo/l/public/', '/view/photo/m/public/');
+  }
+  async function doProxy(rawUrl){
+    const url = shrinkCover(rawUrl);
+    const referer = url.includes('doubanio.com') ? 'https://movie.douban.com/' : 'https://bgm.tv/';
+    for(let attempt=0; attempt<2; attempt++){
+      try{
+        const r = await ctx.http.request({url, headers:{Referer:referer,'User-Agent':'Mozilla/5.0'}, response_type:'base64', timeout_seconds:20, max_bytes:6*1024*1024, cache_seconds:86400, session:'public-covers'});
+        const ct = pickContentType(r);
+        if(r.status===200 && /^image\//.test(ct) && r.body_base64) return `data:${ct};base64,${r.body_base64}`;
+      }catch(e){}
+      await sleep(300*(attempt+1));
+      if(disposed) return null;
+    }
     return null;
   }
   function pickContentType(r){
@@ -96,23 +120,17 @@ export async function mount(root, ctx){
     const v = Array.isArray(entry)?entry[0]:entry;
     return String(v||'').split(';')[0];
   }
-  async function imageProxy(url){
-    if(!url) return null;
-    try{
-      const r = await ctx.http.request({url, headers:{Referer: url.includes('doubanio.com')?'https://movie.douban.com/':'https://bgm.tv/','User-Agent':'Mozilla/5.0'}, response_type:'base64', timeout_seconds:15, max_bytes:1024*1024, cache_seconds:86400, session:'public-covers'});
-      const ct = pickContentType(r);
-      if(r.status===200 && /^image\//.test(ct) && r.body_base64) return `data:${ct};base64,${r.body_base64}`;
-    }catch(e){}
-    return null;
-  }
-  function attachCover(posterWrap, url, title){
+  function attachCover(posterWrap, url){
     const img = posterWrap.querySelector('.poster-img');
     const fb = posterWrap.querySelector('.poster-fallback');
-    if(!url){ if(fb) fb.classList.remove('hidden'); return; }
-    imageProxy(url).then(dataUrl=>{
-      if(disposed) return;
-      if(dataUrl){ img.src=dataUrl; img.hidden=false; img.onerror=()=>{ img.hidden=true; if(fb) fb.classList.remove('hidden'); }; if(fb) fb.classList.add('hidden'); }
-      else { img.hidden=true; if(fb) fb.classList.remove('hidden'); }
+    // 用透明度而不是 hidden 切换：display:none 会让浏览器永远不加载这张图，onload 也就永远不会来。
+    const fail = ()=>{ if(img){ img.classList.remove('ready'); img.removeAttribute('src'); } if(fb) fb.classList.remove('hidden'); };
+    if(!url){ fail(); return; }
+    enqueueCover(url, dataUrl=>{
+      if(!img || !dataUrl){ fail(); return; }
+      img.onload = ()=>{ img.classList.add('ready'); if(fb) fb.classList.add('hidden'); };
+      img.onerror = fail;
+      img.src = dataUrl;
     });
   }
 
@@ -163,7 +181,9 @@ export async function mount(root, ctx){
     S.remote = r.items||[]; rerenderTab();
   }
   async function openWork(work){
-    S.detail = work; S.candidates=[]; S.matchQuery=work.title; S.seasons=[]; S.season=0; S.notice=''; S.restore=false; S.confirmStop=null; S.dialogOpen=true;
+    S.detail = work; S.candidates=[]; S.matchQuery=work.title; S.seasons=[]; S.season=0; S.restore=false; S.confirmStop=null;
+    // 先立刻弹出对话框再等匹配：否则 TMDB 查询要几秒，用户会以为“点了没反应”。
+    S.dialogOpen=true; S.notice='正在匹配 TMDB，请稍候…'; rerenderDialog();
     try{
       const m = await runTask('browse', {action:'match', work}, `browse:match:${Date.now()}`);
       S.detail = m.work||work; S.candidates = m.candidates||[]; S.notice = m.notice||'';
@@ -226,7 +246,15 @@ export async function mount(root, ctx){
 
   // ---- 批量订阅（核心修复：原包无此能力） ----
   function toggleSelect(work){ const k=sourceKeyOf(work); if(S.selection.has(k)) S.selection.delete(k); else S.selection.add(k); updateBulkBar(); }
-  function selectAllVisible(on){ const items = currentItems(); items.forEach(w=>{ const k=sourceKeyOf(w); if(on) S.selection.add(k); else S.selection.delete(k); }); updateBulkBar(); }
+  function selectAllVisible(on){ visibleItems().forEach(w=>{ const k=sourceKeyOf(w); if(on) S.selection.add(k); else S.selection.delete(k); }); updateBulkBar(); }
+  // 片单可能有数百部；首屏只渲染一页，避免同时发起数百次封面代理请求。
+  const PAGE_SIZE = 60;
+  function discoverKey(){ return [S.feed||'all', S.query||'', S.sort||''].join('|'); }
+  function visibleItems(){
+    const all = currentItems();
+    if(S._dkey !== discoverKey()){ S._dkey = discoverKey(); S.viewLimit = PAGE_SIZE; }
+    return all.slice(0, S.viewLimit || PAGE_SIZE);
+  }
   function currentItems(){
     const src = S.remote || itemsForFeed(S.feed);
     let arr = src.filter(w=>(!S.weekday||w.weekday===S.weekday) && (!S.query||S.remote||[w.title,w.originalTitle].join(' ').toLowerCase().includes(S.query.toLowerCase())));
@@ -243,7 +271,7 @@ export async function mount(root, ctx){
     if(!items.length){ toast('请先勾选作品'); return; }
     if(!S.config.proxyId) throw new Error('请先到「追新规则」选择固定 Emby 实例');
     if(S.dirty) throw new Error('规则有未保存的修改，请先保存');
-    let created=0, skipped=0, needManual=[];
+    let created=0, skipped=0, needManual=[], failed=[];
     for(const work of items){
       if(disposed) break;
       try{
@@ -253,12 +281,17 @@ export async function mount(root, ctx){
         const gen = ((S.db.records[identityKey(choice)]&&S.db.records[identityKey(choice)].generation)||0)+1;
         const r = await runTask('engine', {action:'create', work, choice, confirmed:true}, `create:${key}:${choice.mediaType}:${choice.tmdbId}:${choice.season}:${S.config.proxyId}:g${gen}`);
         if(r.hostId||r.existing||r.complete) created++; else if(r.skipped) skipped++;
-      }catch(e){ needManual.push(work); }
+      }catch(e){ failed.push(`${work.title}：${e&&e.message?e.message:String(e)}`); }
     }
     await loadDb();
     S.selection.clear(); updateBulkBar();
-    if(needManual.length){ openWork(needManual[0]); toast(`已订阅 ${created} 条，${needManual.length} 条需手动匹配`); }
-    else toast(`批量订阅完成：新增 ${created} 条${skipped?`，跳过 ${skipped} 条`:''}`);
+    const parts=[`新增 ${created} 条`];
+    if(skipped) parts.push(`跳过 ${skipped} 条`);
+    if(needManual.length) parts.push(`${needManual.length} 条待手动匹配`);
+    if(failed.length) parts.push(`${failed.length} 条失败`);
+    S.error = failed.slice(0,3).join('；');
+    toast('批量订阅：'+parts.join('，'));
+    if(needManual.length) openWork(needManual[0]); else rerenderTab();
   }
   async function autoMatch(work){
     const m = await runTask('browse', {action:'match', work}, `browse:match:${Date.now()}`);
@@ -314,12 +347,12 @@ export async function mount(root, ctx){
     // 来源筛选
     const chips = el('div',{class:'zg-chips'});
     [['all','为你发现'],...Object.entries(FEEDS).map(([id,label])=>[id,label])].forEach(([id,label])=>{
-      chips.append(el('button',{class:'zg-chip'+(S.feed===id?' selected':''), 'aria-pressed':S.feed===id, onClick:()=>{S.feed=id; S.remote=null; S.query=''; S.weekday=0; refreshCatalog().then(rerenderTab).catch(err=>{S.error=err.message;rerenderTab();});}},[
+      chips.append(el('button',{class:'zg-chip'+(S.feed===id?' selected':''), 'aria-pressed':S.feed===id, onClick:()=>{S.feed=id; S.remote=null; S.query=''; S.weekday=0; refreshCatalog().then(rerenderTab).catch(showError);}},[
         id!=='all'?el('span',{class:'src-dot '+(id==='bangumi'?'pink':'green')}):null, label
       ]));
     });
     // 搜索 + 排序
-    const form = el('form',{class:'zg-search', onSubmit:(e)=>{e.preventDefault(); searchCatalog().then(rerenderTab).catch(err=>{S.error=err.message;rerenderTab();});}});
+    const form = el('form',{class:'zg-search', onSubmit:(e)=>{e.preventDefault(); searchCatalog().then(rerenderTab).catch(showError);}});
     const input = el('input',{class:'zg-input', placeholder:'寻找你的下一部…', 'aria-label':'搜索片名', value:S.query, oninput:(e)=>{S.query=e.target.value;}});
     const sel = el('select',{class:'zg-select', 'aria-label':'搜索来源', onchange:(e)=>{S.searchSource=e.target.value;}});
     sel.append(el('option',{value:'douban',text:'豆瓣'}), el('option',{value:'bangumi',text:'Bangumi'}));
@@ -341,21 +374,27 @@ export async function mount(root, ctx){
     const bulkBar = el('div',{class:'zg-bulk', id:'zg-bulk'});
     bulkBar.append(
       el('label',{class:'zg-checkall'},[el('input',{type:'checkbox', onchange:(e)=>selectAllVisible(e.target.checked)}),'全选本页']),
-      el('button',{class:'zg-btn primary', id:'zg-subscribe-selected', text:`订阅所选 (${S.selection.size})`, onClick:()=>busyWrap(subscribeSelected).then(rerenderTab).catch(err=>{S.error=err.message;rerenderTab();})}),
+      el('button',{class:'zg-btn primary', id:'zg-subscribe-selected', text:`订阅所选 (${S.selection.size})`, onClick:()=>busyWrap(subscribeSelected).then(rerenderTab).catch(showError)}),
       el('button',{class:'zg-btn', text:'清空选择', onClick:()=>{S.selection.clear(); updateBulkBar();}})
     );
     box.append(bulkBar);
 
     // 网格
-    const items = currentItems();
+    const all = currentItems();
+    const items = visibleItems();
     const grid = el('div',{class:'zg-grid'});
-    if(!items.length){
+    if(!all.length){
       grid.append(el('div',{class:'zg-empty'},[el('div',{class:'zg-ico big',text:'◎'}), el('h3',{text:S.busy?'正在寻找好故事':(S.remote?'没有匹配的搜索结果':'还没有片单')}), el('p',{text:'调整筛选条件，或刷新公开片单。'}),
-        el('button',{class:'zg-btn',text:'刷新片单', onClick:()=>busyWrap(refreshCatalog).then(rerenderTab).catch(err=>{S.error=err.message;rerenderTab();})})]));
+        el('button',{class:'zg-btn',text:'刷新片单', onClick:()=>busyWrap(refreshCatalog).then(rerenderTab).catch(showError)})]));
     } else {
       items.forEach(w=>grid.append(renderCard(w)));
     }
     box.append(grid);
+    if(all.length > items.length){
+      box.append(el('div',{class:'zg-more'},[
+        el('button',{class:'zg-btn', text:`显示更多（已显示 ${items.length} / ${all.length}）`, onClick:()=>{ S.viewLimit=(S.viewLimit||PAGE_SIZE)+PAGE_SIZE; rerenderTab(); }})
+      ]));
+    }
     box.append(el('div',{class:'zg-foot'},[el('span',{text:'好故事不必急着看，先把期待收藏好。'}),el('span',{text:'公开目录快照 · 资源搜索由宿主完成'})]));
     return box;
   }
@@ -363,12 +402,12 @@ export async function mount(root, ctx){
     const k=sourceKeyOf(w);
     const poster = el('div',{class:'poster'});
     const fb = el('div',{class:'poster-fallback'},[el('span',{class:'zg-ico',text:'◎'}), el('span',{text:w.title})]);
-    const img = el('img',{class:'poster-img', alt:w.title+'海报', loading:'lazy', decoding:'async', hidden:true});
+    const img = el('img',{class:'poster-img', alt:w.title+'海报', decoding:'async'});
     poster.append(fb, img);
     attachCover(poster, w.cover, w.title);
     const card = el('article',{class:'media-card'+(S.selection.has(k)?' selected':'')},[
       el('label',{class:'card-check'},[el('input',{type:'checkbox', checked:S.selection.has(k), onchange:()=>{toggleSelect(w); card.classList.toggle('selected');}})]),
-      el('button',{class:'poster-btn', 'aria-label':'查看并订阅 '+w.title, onClick:()=>busyWrap(()=>openWork(w)).catch(err=>{S.error=err.message;rerenderTab();})},[poster]),
+      el('button',{class:'poster-btn', 'aria-label':'查看并订阅 '+w.title, onClick:()=>busyWrap(()=>openWork(w)).catch(showError)},[poster]),
       el('div',{class:'card-meta'},[
         el('h3',{text:w.title}),
         el('p',{text:[w.year||'待确认年份', w.source==='bangumi'?(w.weekday?WEEKDAYS[w.weekday-1]+'放送':'动画'):w.mediaType==='movie'?'电影':(w.progress||'剧集')].join(' · ')}),
@@ -378,7 +417,7 @@ export async function mount(root, ctx){
           itemBadge(w)?el('span',{class:'badge', text:itemBadge(w)}):null
         ])
       ]),
-      el('button',{class:'card-plus', 'aria-label':'订阅 '+w.title, onClick:()=>busyWrap(()=>openWork(w)).catch(err=>{S.error=err.message;rerenderTab();})},[el('span',{class:'zg-ico',text:'＋'})])
+      el('button',{class:'card-plus', 'aria-label':'订阅 '+w.title, onClick:()=>busyWrap(()=>openWork(w)).catch(showError)},[el('span',{class:'zg-ico',text:'＋'})])
     ]);
     return card;
   }
@@ -403,14 +442,14 @@ export async function mount(root, ctx){
     const grid = el('div',{class:'zg-grid'});
     if(!filt.length) grid.append(el('div',{class:'zg-empty'},[el('h3',{text:'还没有订阅'}),el('p',{text:'去发现页，选一部你期待的故事。'}),el('button',{class:'zg-btn',text:'去发现',onClick:()=>switchTab('discover')})]));
     filt.forEach(r=>{
-      const poster = el('div',{class:'poster'}); const fb=el('div',{class:'poster-fallback'},[el('span',{class:'zg-ico',text:'◎'}),el('span',{text:r.work&&r.work.title||'作品'})]); const img=el('img',{class:'poster-img',loading:'lazy',decoding:'async',hidden:true}); poster.append(fb,img);
+      const poster = el('div',{class:'poster'}); const fb=el('div',{class:'poster-fallback'},[el('span',{class:'zg-ico',text:'◎'}),el('span',{text:r.work&&r.work.title||'作品'})]); const img=el('img',{class:'poster-img',decoding:'async'}); poster.append(fb,img);
       if(r.work) attachCover(poster, r.work.cover, r.work.title);
       grid.append(el('article',{class:'media-card'},[poster, el('div',{class:'card-meta'},[
         el('h3',{text:(r.work&&r.work.title)||'作品'}),
         el('p',{text:STATUS_NAMES[r.status]||r.status}),
         r.covered?el('p',{class:'sub',text:'已拥有 '+r.covered+' 集'}):null,
         r.error?el('p',{class:'err',text:r.error}):null,
-        el('button',{class:'zg-btn small', text:r.status==='blocked'?'恢复订阅':'停止订阅', onClick:()=>busyWrap(()=>askStop(r)).catch(err=>{S.error=err.message;rerenderTab();})})
+        el('button',{class:'zg-btn small', text:r.status==='blocked'?'恢复订阅':'停止订阅', onClick:()=>busyWrap(()=>askStop(r)).catch(showError)})
       ])]));
     });
     box.append(grid);
@@ -434,7 +473,7 @@ export async function mount(root, ctx){
     autoWrap.append(autoCb, el('span',{class:'slider'}), el('span',{class:'switch-label', text:'启用自动追新'}));
     form.append(field('自动追新', autoWrap, '开启后，插件按间隔自动从公开目录发现并订阅符合条件的作品（需先选择 Emby 实例）。也可随时点“立即追新”手动触发。'));
     // 立即追新按钮
-    form.append(el('button',{class:'zg-btn primary', text:'立即追新一次', onClick:()=>busyWrap(runAutoNow).then(rerenderTab).catch(err=>{S.error=err.message;rerenderTab();}), disabled:S.busy}));
+    form.append(el('button',{class:'zg-btn primary', text:'立即追新一次', onClick:()=>busyWrap(runAutoNow).then(rerenderTab).catch(showError), disabled:S.busy}));
     // 来源
     const feedsWrap = el('div',{class:'zg-feeds'});
     Object.keys(FEEDS).forEach(f=>{ const l=el('label',{class:'zg-check'}); const c=el('input',{type:'checkbox',checked:!!S.config.feeds[f],onchange:(e)=>{S.config.feeds[f]=e.target.checked;S.dirty=true;}}); l.append(c, FEEDS[f]); feedsWrap.append(l); });
@@ -452,8 +491,8 @@ export async function mount(root, ctx){
     form.append(field('即将上映·上映窗口(天)', numInput('soonWindowDays',1,365,1)));
     box.append(form);
     box.append(el('div',{class:'zg-actions'},[
-      el('button',{class:'zg-btn primary', text:'保存规则', onClick:()=>busyWrap(saveRules).then(rerenderTab).catch(err=>{S.error=err.message;rerenderTab();}), disabled:S.busy}),
-      el('button',{class:'zg-btn', text:'核对宿主订阅', onClick:()=>busyWrap(syncNow).then(rerenderTab).catch(err=>{S.error=err.message;rerenderTab();}), disabled:S.busy})
+      el('button',{class:'zg-btn primary', text:'保存规则', onClick:()=>busyWrap(saveRules).then(rerenderTab).catch(showError), disabled:S.busy}),
+      el('button',{class:'zg-btn', text:'核对宿主订阅', onClick:()=>busyWrap(syncNow).then(rerenderTab).catch(showError), disabled:S.busy})
     ]));
     updateRulesValidity();
     return box;
@@ -467,7 +506,7 @@ export async function mount(root, ctx){
   function renderActivity(){
     const box = el('div',{class:'zg-act'});
     box.append(el('div',{class:'page-title'},[el('div',{class:'eyebrow',text:'ACTIVITY'}),el('h1',{text:'每一次追新，都有迹可循。'}),el('p',{text:'最近一次追新：'+fmtTime(S.db.lastAuto)+'；最近核对：'+fmtTime(S.db.lastSync)})]));
-    box.append(el('div',{class:'zg-actions'},[el('button',{class:'zg-btn',text:'核对宿主订阅',onClick:()=>busyWrap(syncNow).then(rerenderTab).catch(err=>{S.error=err.message;rerenderTab();}),disabled:S.busy})]));
+    box.append(el('div',{class:'zg-actions'},[el('button',{class:'zg-btn',text:'核对宿主订阅',onClick:()=>busyWrap(syncNow).then(rerenderTab).catch(showError),disabled:S.busy})]));
     const logs = (S.db.logs||[]).slice(0,40);
     box.append(el('h3',{class:'zg-sub',text:'日志'}));
     const logBox = el('div',{class:'zg-logs glass'});
@@ -477,14 +516,14 @@ export async function mount(root, ctx){
     box.append(el('h3',{class:'zg-sub',text:'运行任务'}));
     const runsBox = el('div',{class:'zg-runs glass'});
     if(!S.runs.length) runsBox.append(el('div',{class:'zg-empty small',text:'暂无运行记录'}));
-    S.runs.forEach(t=>runsBox.append(el('div',{class:'run-item'},[el('span',{class:'run-title',text:(t.title||t.id||'任务')}), el('span',{class:'run-status '+t.status,text:t.status}), t.status==='attention_required'?el('button',{class:'zg-btn small',text:'恢复核对',onClick:()=>busyWrap(()=>retryRun(t.id)).catch(err=>{S.error=err.message;rerenderTab();})},):null])));
+    S.runs.forEach(t=>runsBox.append(el('div',{class:'run-item'},[el('span',{class:'run-title',text:(t.title||t.id||'任务')}), el('span',{class:'run-status '+t.status,text:t.status}), t.status==='attention_required'?el('button',{class:'zg-btn small',text:'恢复核对',onClick:()=>busyWrap(()=>retryRun(t.id)).catch(showError)},):null])));
     box.append(runsBox);
     return box;
   }
 
   // ---- 详情 / 匹配对话框 ----
   function renderDialog(){
-    const dlg = main.querySelector('.zg-dialog');
+    let dlg = main.querySelector('.zg-dialog');
     if(!S.dialogOpen){ if(dlg) dlg.remove(); return; }
     if(!dlg){
       const back = el('div',{class:'zg-dialog-back', onClick:()=>{S.dialogOpen=false; rerenderDialog();}});
@@ -494,7 +533,7 @@ export async function mount(root, ctx){
     }
     const card = dlg.querySelector('.zg-dialog-card'); clear(card);
     const w = S.detail;
-    const poster = el('div',{class:'poster small'}); const fb=el('div',{class:'poster-fallback'},[el('span',{class:'zg-ico',text:'◎'}),el('span',text:(w&&w.title)||'作品'})]); const img=el('img',{class:'poster-img',loading:'lazy',decoding:'async',hidden:true}); poster.append(fb,img);
+    const poster = el('div',{class:'poster small'}); const fb=el('div',{class:'poster-fallback'},[el('span',{class:'zg-ico',text:'◎'}),el('span',{text:(w&&w.title)||'作品'})]); const img=el('img',{class:'poster-img',decoding:'async'}); poster.append(fb,img);
     if(w) attachCover(poster, w.cover, w.title);
     card.append(el('button',{class:'zg-close',text:'✕','aria-label':'关闭',onClick:()=>{S.dialogOpen=false; rerenderDialog();}}));
     card.append(el('div',{class:'dlg-top'},[poster, el('div',{},[el('h2',{text:(w&&w.title)||'作品'}), el('p',{text:(w&&[w.year,'·',w.source==='bangumi'?'动画':'影视'].join(' '))||''}), S.notice?el('p',{class:'dlg-notice',text:S.notice}):null])]));
@@ -523,15 +562,19 @@ export async function mount(root, ctx){
     if(S.confirmStop){
       card.append(el('h3',{class:'zg-sub',text:'停止订阅'}));
       card.append(el('p',{class:'dlg-notice',text:S.confirmStop.status==='unknown'?'此订阅提交结果未知，先在宿主核对，不能释放名额或重发。':''}));
-      card.append(el('button',{class:'zg-btn danger',text:S.confirmStop.confirmAbsent?'确认未创建并停订':'停止订阅',onClick:()=>busyWrap(stopSub).then(renderDialog).catch(err=>{S.error=err.message;rerenderDialog();})}));
+      card.append(el('button',{class:'zg-btn danger',text:S.confirmStop.confirmAbsent?'确认未创建并停订':'停止订阅',onClick:()=>busyWrap(stopSub).then(renderDialog).catch(err=>{S.error=err.message;rerenderDialog();rerenderHeaderOnly();})}));
     } else if(S.candidates.length){
-      card.append(el('button',{class:'zg-btn primary',text:S.restore?'手动恢复订阅':'创建订阅',onClick:()=>busyWrap(createSub).then(rerenderTab).catch(err=>{S.error=err.message;rerenderDialog();})},));
+      card.append(el('button',{class:'zg-btn primary',text:S.restore?'手动恢复订阅':'创建订阅',onClick:()=>busyWrap(createSub).then(rerenderTab).catch(err=>{S.error=err.message;rerenderDialog();rerenderHeaderOnly();})},));
     }
     return dlg;
   }
+  // renderDialog 自身幂等（无对话框时移除、有则重建），这里只做语义化别名，供各处统一调用。
+  function rerenderDialog(){ return renderDialog(); }
+  function closeDialog(){ S.dialogOpen=false; S.notice=''; S.candidates=[]; S.seasons=[]; rerenderDialog(); updateBulkBar(); }
 
   // ---- 小工具 ----
   async function busyWrap(fn){ S.busy=true; S.error=''; rerenderHeaderOnly(); try{ return await fn(); } finally { S.busy=false; rerenderHeaderOnly(); } }
+  function showError(err){ S.error=(err&&err.message)||String(err); S.busy=false; rerenderHeaderOnly(); rerenderTab(); }
   function rerenderHeaderOnly(){ const old=main.querySelector('.zg-header'); if(old){ const h=renderHeader(); old.replaceWith(h); } else main.prepend(renderHeader()); }
   function toast(msg){ S.toast=msg; const old=main.querySelector('.zg-toast'); if(old) old.remove(); main.querySelector('.zg-header').append(el('div',{class:'zg-toast',text:msg})); setTimeout(()=>{ S.toast=''; const t=main.querySelector('.zg-toast'); if(t) t.remove(); }, 4200); }
 
@@ -584,6 +627,7 @@ const CSS = `
 .zg-btn.small{padding:6px 12px;font-size:13px}
 .zg-btn.danger{color:#fff;background:#e0533d;border-color:#e0533d}
 .zg-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:16px}
+.zg-more{display:flex;justify-content:center;margin:20px 0 4px}
 .media-card{position:relative;display:flex;flex-direction:column;background:var(--app-surface,#1a1d24);border:1px solid var(--app-border,#2a2f3a);border-radius:14px;overflow:hidden;transition:.15s}
 .media-card:hover{transform:translateY(-3px);border-color:var(--app-accent,#7c5cff);box-shadow:0 8px 24px rgba(0,0,0,.35)}
 .media-card.selected{border-color:var(--app-accent,#7c5cff);box-shadow:0 0 0 2px var(--app-accent,#7c5cff)}
@@ -592,7 +636,8 @@ const CSS = `
 .poster-btn{border:none;padding:0;background:none;cursor:pointer;display:block;width:100%}
 .poster{position:relative;width:100%;aspect-ratio:2/3;background:linear-gradient(135deg,#2a2f3a,#1a1d24);display:flex;align-items:center;justify-content:center;overflow:hidden}
 .poster.small{aspect-ratio:2/3;width:120px}
-.poster-img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+.poster-img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:0;transition:opacity .18s}
+.poster-img.ready{opacity:1}
 .poster-fallback{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;padding:12px;text-align:center;color:var(--app-text-secondary,#9aa3b2);font-size:13px}
 .poster-fallback.hidden{display:none}
 .poster-fallback .zg-ico{font-size:30px;opacity:.5}
