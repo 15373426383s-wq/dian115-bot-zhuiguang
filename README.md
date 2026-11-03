@@ -25,20 +25,3 @@
 宿主每 5 分钟调度一次，自动目录检查按所设间隔运行。每轮最多核对 24 条新作品详情、约 6 分钟软时间预算，保存轮转位置；单来源验证/异常不拖住其他来源。每次自动创建前重新核对宿主。固定实例不可用时暂停，不回退到默认实例。旧版 `id=0` 动态默认实例不适用于固定绑定。
 
 删除保护覆盖**本插件已创建或已关联并记录过的订阅**；无法知道安装前已删除的历史。停用保留插件数据，卸载清空插件 KV、缓存和任务，停订记忆也随之清空；卸载不撤销已创建的宿主订阅或媒体文件。升级同一插件 ID 保留数据。
-
-## 开发与验证
-
-```sh
-npm ci
-npm test
-npm run build
-npm run check
-npm run package
-npm run dev -- --port 5178
-```
-
-`src/preview.js` 与 `src/preview-data.json` 只供本地交互预览，包含模拟宿主且明确标识。生产入口为 `ui/page.js`，不包含预览客户端。打包白名单仅包含 `plugin.json`、`ui/`、`lib/`、`jobs/` 和说明文件；不包含依赖目录、预览海报、测试工件、凭据或宿主私有源码。
-
-构建依赖 Vue 3.5.44 与 Vite 6.4.5，后台为不依赖 Node 的 ESM。公开接口按技能自带契约实现。测试边界和实际结果见 `VALIDATION.md`。
-
-来源参考：[Bangumi 官方 API](https://bangumi.github.io/api/)、[Bangumi API 仓库](https://github.com/bangumi/api)、[豆瓣电影](https://movie.douban.com/)。
