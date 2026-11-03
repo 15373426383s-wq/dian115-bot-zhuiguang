@@ -260,7 +260,7 @@ export async function mount(root, ctx){
   // ---- 应用状态 ----
   const S = {
     tab:'discover', config:DEFAULT_CONFIG(), db:INITIAL_STATE(), emby:[], runs:[],
-    feed:'all', query:'', searchSource:'douban', sort:'default', remote:null, weekday:0,
+    feed:'douban-tv', query:'', searchSource:'douban', sort:'default', remote:null, weekday:0,
     busy:false, error:'', toast:'', lastFetch:0, sourceErrors:[],
     selection:new Set(), // 发现页勾选的作品 sourceKey 集合
     detail:null, candidates:[], matchQuery:'', seasons:[], season:0, notice:'', restore:false,
@@ -454,7 +454,17 @@ export async function mount(root, ctx){
   wrap.append(shell);
   root.append(wrap);
 
-  function switchTab(id){ S.tab=id; if(id==='activity'){ loadRuns().catch(()=>{}); } if(id==='rules'){ loadEmby().catch(()=>{}); } rerenderAll(); }
+  const TAB_ORDER = ['discover','library','rules','activity'];
+  function switchTab(id){
+    S.tab=id; if(id==='activity'){ loadRuns().catch(()=>{}); } if(id==='rules'){ loadEmby().catch(()=>{}); }
+    // 导航栏只在挂载时渲染一次，切换页签必须在这里同步高亮，否则永远停在初始页签上
+    [...rail.querySelectorAll('.zg-tab')].forEach((b,i)=>{
+      const on = TAB_ORDER[i]===id;
+      b.classList.toggle('active', on);
+      if(on) b.setAttribute('aria-current','page'); else b.removeAttribute('aria-current');
+    });
+    rerenderAll();
+  }
   function rerenderAll(){ clear(main); main.append(renderHeader()); main.append(renderTab()); }
   function rerenderTab(){ const old = main.querySelector('.zg-tabbody'); if(old) old.remove(); main.append(renderTab()); }
   function renderHeader(){
@@ -484,8 +494,9 @@ export async function mount(root, ctx){
   function renderDiscover(){
     const box = el('div',{class:'zg-disc'});
     // 来源筛选
+    // 来源筛选（去掉了聚合入口「为你发现」：需要看全部时用搜索即可）
     const chips = el('div',{class:'zg-chips'});
-    [['all','为你发现'],...Object.entries(FEEDS).map(([id,label])=>[id,label])].forEach(([id,label])=>{
+    Object.entries(FEEDS).map(([id,label])=>[id,label]).forEach(([id,label])=>{
       chips.append(el('button',{class:'zg-chip'+(S.feed===id?' selected':''), 'aria-pressed':S.feed===id, onClick:()=>{
         if(S.feed===id && !S.busy) return;
         S.feed=id; S.remote=null; S.query=''; S.weekday=0;
@@ -782,8 +793,10 @@ const CSS = `
 .zg-app .zg-rail{border-radius:0 28px 28px 0;position:sticky;top:0;height:100vh;max-height:1000px;display:flex;flex-direction:column;align-items:center;gap:5px;padding:26px 8px;z-index:5;border-left:0}
 .zg-app .zg-mark{display:grid;place-items:center;width:44px;height:44px;border-radius:15px;background:linear-gradient(150deg,#216b5d,#0b423d);color:#fff;font-size:16px;font-weight:700;box-shadow:inset 0 1px #ffffff60,0 4px 10px #25524720;margin-bottom:16px;letter-spacing:1px}
 .zg-app .zg-tab{width:62px;padding:10px 0 8px;display:flex;flex-direction:column;align-items:center;gap:5px;border:0;border-radius:14px;background:transparent;color:var(--muted);font:inherit;font-size:10px;font-weight:600;cursor:pointer;transition:background .16s,color .16s}
-.zg-app .zg-tab:hover{color:var(--text);background:var(--accent-soft)}
+.zg-app .zg-tab:hover{color:var(--text)}
 .zg-app .zg-tab.active{color:var(--accent);background:var(--accent-soft)}
+/* 触屏会把 :hover “粘”在最后点过的 tab 上，导致两个 tab 同时高亮 —— 只让真正有鼠标的设备享受 hover 背景 */
+@media (hover:hover){ .zg-app .zg-tab:hover{background:var(--accent-soft)} }
 .zg-app .zg-ico{font-style:normal;font-size:17px;line-height:1}
 .zg-app .zg-ico.big{font-size:34px;opacity:.45}
 .zg-app .zg-main{padding:0 42px 72px;min-width:0}
