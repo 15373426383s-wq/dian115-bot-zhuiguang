@@ -24,11 +24,13 @@ function errStatus(e){
 function humanError(e){
   const msg = (e&&e.message)||String(e);
   const st = errStatus(e);
+  if(/active or unconfirmed run|job has an active/i.test(msg)) return '同一个任务已有实例在运行，等它结束再试';
   if(st===401||st===403) return '登录状态已失效，请刷新宿主页面后重试';
   if(st===404) return '宿主接口不存在（插件与宿主版本可能不匹配），请刷新页面重试';
   if(st===409) return '数据刚被其他页面改过，请刷新后重试';
   if(st===429) return '操作太频繁，宿主暂时限流，请等几秒再试';
   if(st>=500) return `宿主内部错误（HTTP ${st}），请稍后重试`;
+  if(st===400) return '宿主拒绝了这次请求：通常是同一个任务还在跑，等几秒或刷新页面再试';
   if(st>=400) return `宿主拒绝了这次请求（HTTP ${st}）。先刷新页面重试；仍失败请到「记录」查看最近任务。`;
   return msg;
 }
@@ -89,14 +91,44 @@ export async function mount(root, ctx){
   }
 
   // ---- 任务 ----
-  async function runTask(jobId, input, runId){
+  // 宿主的 browse 没有开队列（queue:false / allow_overlap:false）：已有任务在跑时再创建
+  // 会直接返回 400 "job has an active or unconfirmed run"。抓一份豆瓣片单要好几秒，
+  // 这期间用户点一下筛选就会撞上，错误的红条还一直挂着不消失。
+  // 所以同一个 job 上的调用在这里串行排队，后一个等前一个结束再发。
+  const _jobChain = new Map();
+  function runTask(jobId, input, runId){
+    const prev = _jobChain.get(jobId) || Promise.resolve();
+    const next = prev.catch(()=>{}).then(()=>executeTask(jobId, input, runId));
+    _jobChain.set(jobId, next.catch(()=>{}));
+    return next;
+  }
+  // 页面自己的点击已经串行，但定时任务或另一个标签页仍可能正在占用同一个 job，
+  // 这时宿主会回 400。先查一下当前有没有活跃实例：能等就等一下，需要人工核对就直说。
+  async function activeRunState(jobId){
+    try{
+      const runs = await ctx.tasks.list(20);
+      const hit = (runs||[]).find(r=>r && r.job_id===jobId && (r.status==='running'||r.status==='queued'||r.status==='attention_required'));
+      return hit?hit.status:'';
+    }catch(e){ return ''; }
+  }
+  async function executeTask(jobId, input, runId){
     // 宿主签名是 tasks.run(job, business_key, input)：第二参是稳定业务键，第三参才是任务载荷。
     const key = runId || `${jobId}:${input&&input.action||'run'}:${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    let task = await ctx.tasks.run(jobId, key, input);
-    const wait = (ms)=>new Promise(r=>setTimeout(r,ms));
+    let task = null;
+    for(let attempt=0; attempt<4 && !disposed; attempt++){
+      try{ task = await ctx.tasks.run(jobId, key, input); break; }
+      catch(e){
+        if(errStatus(e)!==400) throw e;
+        const st = await activeRunState(jobId);
+        if(st==='attention_required') throw new Error('上一次运行中断还没核对，请到「记录」点「恢复核对」后再试');
+        if((st==='running'||st==='queued') && attempt<3){ await sleep(700+attempt*600); continue; }
+        throw new Error('同一个任务已有实例在运行，请等它结束后再试');
+      }
+    }
+    if(!task) throw new Error('任务没能启动，请刷新页面后重试');
     for(let guard=0; guard<600 && !disposed; guard++){
       if(['succeeded','failed','cancelled','attention_required'].includes(task.status)) break;
-      await wait(650);
+      await sleep(650);
       task = await ctx.tasks.get(task.id);
     }
     if(disposed) throw new Error('页面已关闭');
@@ -236,6 +268,7 @@ export async function mount(root, ctx){
   };
 
   // ---- 数据加载 ----
+  let _refreshing = false, _refreshAgain = false;
   async function loadConfig(){ S.config = await apiGet('config', DEFAULT_CONFIG()).then(r=>{ S.dirty=false; return r.value; }); }
   async function loadDb(){ S.db = (await apiGet('state', INITIAL_STATE())).value; }
   async function loadEmby(){ const r = await ctx.api.get('/api/plugin-host/emby/instances'); if(!Array.isArray(r.items)) throw new Error('Emby 实例列表无效'); S.emby = r.items; }
@@ -243,12 +276,20 @@ export async function mount(root, ctx){
   async function loadAll(){ await loadConfig(); await loadDb(); try{ await loadEmby(); }catch(e){} try{ await loadRuns(); }catch(e){} if(!Object.keys(S.db.catalog).length) await refreshCatalog(); }
 
   async function refreshCatalog(){
-    S.remote=null;
-    await runTask('browse', S.feed==='all'?{}:{feed:S.feed}, `browse:refresh:${Date.now()}`);
-    await loadDb();
-    S.lastFetch = Math.max(0, ...Object.values(S.db.catalog).map(v=>v.at||0));
-    S.sourceErrors = Object.entries(S.db.catalog).filter(([k,v])=>v.error && (S.feed==='all'||S.feed===k)).map(([k,v])=>`${FEEDS[k]}：${v.error}`);
-    rerenderTab();
+    // 连点筛选时不要把每个点击都变成一个抓取任务：合并成“抓最新选中的那一个”。
+    if(_refreshing){ _refreshAgain = true; return; }
+    _refreshing = true;
+    try{
+      do{
+        _refreshAgain = false;
+        S.remote=null;
+        await runTask('browse', S.feed==='all'?{}:{feed:S.feed}, `browse:refresh:${Date.now()}`);
+        await loadDb();
+        S.lastFetch = Math.max(0, ...Object.values(S.db.catalog).map(v=>v.at||0));
+        S.sourceErrors = Object.entries(S.db.catalog).filter(([k,v])=>v.error && (S.feed==='all'||S.feed===k)).map(([k,v])=>`${FEEDS[k]}：${v.error}`);
+        if(!disposed) rerenderTab();
+      } while(_refreshAgain && !disposed);
+    } finally { _refreshing = false; }
   }
   async function searchCatalog(){
     if(!S.query.trim()){ S.remote=null; rerenderTab(); return; }
@@ -427,7 +468,7 @@ export async function mount(root, ctx){
           el('span',{html:'固定实例 · <b>'+esc(inst)+'</b>'})
         ])
       ]),
-      S.error?el('div',{class:'alert error', text:S.error}):null
+      S.error?el('div',{class:'alert error'},[el('span',{text:S.error}), el('button',{class:'alert-x', 'aria-label':'关闭提示', text:'✕', onClick:()=>{S.error=''; rerenderHeaderOnly();}})]) : null
     ]);
   }
   function renderTab(){
@@ -445,7 +486,12 @@ export async function mount(root, ctx){
     // 来源筛选
     const chips = el('div',{class:'zg-chips'});
     [['all','为你发现'],...Object.entries(FEEDS).map(([id,label])=>[id,label])].forEach(([id,label])=>{
-      chips.append(el('button',{class:'zg-chip'+(S.feed===id?' selected':''), 'aria-pressed':S.feed===id, onClick:()=>{S.feed=id; S.remote=null; S.query=''; S.weekday=0; refreshCatalog().then(rerenderTab).catch(showError);}},[
+      chips.append(el('button',{class:'zg-chip'+(S.feed===id?' selected':''), 'aria-pressed':S.feed===id, onClick:()=>{
+        if(S.feed===id && !S.busy) return;
+        S.feed=id; S.remote=null; S.query=''; S.weekday=0;
+        rerenderTab();                       // 先让选中态立刻亮起来，别等抓取回来
+        busyWrap(refreshCatalog).then(rerenderTab).catch(showError);
+      }},[
         id!=='all'?el('span',{class:'src-dot '+(id==='bangumi'?'pink':'green')}):null, label
       ]));
     });
@@ -751,7 +797,10 @@ const CSS = `
 .zg-app .status-dot.offline{background:var(--muted);box-shadow:none}
 .zg-app .zg-spinner{width:16px;height:16px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:zg-spin .8s linear infinite}
 @keyframes zg-spin{to{transform:rotate(360deg)}}
-.zg-app .alert{display:flex;align-items:center;gap:10px;flex-basis:100%;padding:12px 15px;border:1px solid var(--border);border-radius:12px;background:var(--surface);font-size:12px;margin:0 0 14px;overflow-wrap:anywhere;line-height:1.6}
+.zg-app .alert{display:flex;align-items:center;gap:10px;align-items:flex-start;flex-basis:100%;padding:12px 15px;border:1px solid var(--border);border-radius:12px;background:var(--surface);font-size:12px;margin:0 0 14px;overflow-wrap:anywhere;line-height:1.6}
+.zg-app .alert>span{flex:1}
+.zg-app .alert-x{flex:none;width:22px;height:22px;border:0;border-radius:7px;background:transparent;color:inherit;opacity:.5;font:inherit;font-size:12px;line-height:1;cursor:pointer}
+.zg-app .alert-x:hover{opacity:1;background:rgba(0,0,0,.06)}
 .zg-app .alert.error{background:#fceced;border-color:#f0c9cc;color:var(--error)}
 .zg-app .alert.warn{background:#fdf4e6;border-color:#eddcbf;color:var(--warm)}
 .zg-app[data-theme=dark] .alert.error{background:#3a2325;border-color:#5c3134}
