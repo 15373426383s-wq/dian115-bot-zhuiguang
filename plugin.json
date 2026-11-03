@@ -1,5 +1,5 @@
 {
-  "schema_version":3,"id":"bot.zhuiguang","name":"追光","version":"1.1.5","author":"bot",
+  "schema_version":3,"id":"bot.zhuiguang","name":"追光","version":"1.1.18","author":"bot",
   "description":"豆瓣影视与 Bangumi 新番追新，固定 Emby 实例、120 条订阅上限与持久停订保护。",
   "requires":{"api":"3.5"},"icon":"ui/icon.svg","ui":{"entry":"ui/page.js"},"menu":{"title":"追光","order":44},
   "jobs":[

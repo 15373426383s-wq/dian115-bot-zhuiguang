@@ -13,6 +13,25 @@ const HOST_NAMES = {pending:'等待资源',searching:'搜索资源',transferring
 const DEFAULT_CONFIG = ()=>({proxyId:null,proxyName:'',auto:false,intervalMinutes:60,feeds:{'douban-tv':true,'douban-movie':true,'douban-soon':true,bangumi:true},minScore:7,minVotes:0,yearFrom:new Date().getFullYear(),include:'',exclude:'',pageCount:2,minWish:5000,soonWindowDays:30});
 const INITIAL_STATE = ()=>({version:1,records:{},blocks:{},catalog:{},review:{},logs:[],lastSync:0,lastAuto:0});
 const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
+// 宿主的 HTTP 错误有时只带 message（"Request failed with status code 400"），故两种都认。
+function errStatus(e){
+  if(!e) return 0;
+  const direct = e.status || (e.response&&e.response.status) || (e.response&&e.response.data&&e.response.data.status);
+  if(Number.isFinite(Number(direct)) && Number(direct)>=100) return Number(direct);
+  const m = /status code (\d{3})/i.exec(String(e.message||e));
+  return m?Number(m[1]):0;
+}
+function humanError(e){
+  const msg = (e&&e.message)||String(e);
+  const st = errStatus(e);
+  if(st===401||st===403) return '登录状态已失效，请刷新宿主页面后重试';
+  if(st===404) return '宿主接口不存在（插件与宿主版本可能不匹配），请刷新页面重试';
+  if(st===409) return '数据刚被其他页面改过，请刷新后重试';
+  if(st===429) return '操作太频繁，宿主暂时限流，请等几秒再试';
+  if(st>=500) return `宿主内部错误（HTTP ${st}），请稍后重试`;
+  if(st>=400) return `宿主拒绝了这次请求（HTTP ${st}）。先刷新页面重试；仍失败请到「记录」查看最近任务。`;
+  return msg;
+}
 
 function el(tag, props, children){
   const n = document.createElement(tag);
@@ -22,6 +41,10 @@ function el(tag, props, children){
     else if(k==='text') n.textContent = v;
     else if(k==='html') n.innerHTML = v;
     else if(k==='disabled') n.disabled = !!v;
+    // checked / selected / value 必须走 property：setAttribute('checked', false) 会把属性设成字符串
+    // "false"，而布尔属性只要出现就算真 —— 结果每一张卡片的勾选框都被渲染成已勾选。
+    else if(k==='checked'||k==='selected') n[k] = !!v;
+    else if(k==='value') n.value = v==null?'':v;
     else if(k.startsWith('on') && typeof v==='function') n.addEventListener(k.slice(2).toLowerCase(), v);
     else if(v!=null) n.setAttribute(k, v);
   }
@@ -43,7 +66,15 @@ export async function mount(root, ctx){
 
   // ---- 存储 ----
   async function apiGet(key, fallback){
-    const r = await ctx.api.get(`/api/extensions/v3/${encodeURIComponent(pid)}/storage/${encodeURIComponent(key)}`);
+    let r;
+    try{ r = await ctx.api.get(`/api/extensions/v3/${encodeURIComponent(pid)}/storage/${encodeURIComponent(key)}`); }
+    catch(e){
+      // 首次安装 / 卸载重装后存储键还不存在，宿主会用 4xx 表达“没有这个键”。
+      // 这不是故障，按“还没有值”处理，否则整页会被顶成一条红色报错。
+      const st = errStatus(e);
+      if(st===404) return { value: structuredClone(fallback!=null?fallback:null), revision:0 };
+      throw e;
+    }
     if(!r || typeof r.revision!=='number') throw new Error('插件存储响应无效');
     return { value: r.value!=null?r.value:structuredClone(fallback!=null?fallback:null), revision: r.revision };
   }
@@ -52,9 +83,9 @@ export async function mount(root, ctx){
       const cur = await apiGet(key, fallback);
       const out = fn(cur.value);
       try{ await ctx.api.put(`/api/extensions/v3/${encodeURIComponent(pid)}/storage/${encodeURIComponent(key)}`, {value:out, expected_revision:cur.revision}); return out; }
-      catch(e){ if(!/409/.test(String(e&&(e.status||e.response&&e.response.status)))) throw e; }
+      catch(e){ if(errStatus(e)!==409) throw e; }
     }
-    throw new Error('保存遇到并发冲突，请刷新后重试');
+    throw new Error('保存遇到并发冲突（可能有另一个页面同时修改），请刷新后重试');
   }
 
   // ---- 任务 ----
@@ -671,7 +702,7 @@ export async function mount(root, ctx){
   // ---- 小工具 ----
   async function busyWrap(fn){ S.busy=true; S.error=''; rerenderHeaderOnly(); try{ return await fn(); } finally { S.busy=false; rerenderHeaderOnly(); } }
   function showError(err){
-    S.error=(err&&err.message)||String(err); S.busy=false;
+    S.error=humanError(err); S.busy=false;
     rerenderHeaderOnly(); rerenderTab();
     const bad = main.querySelector('.zg-field.invalid');
     if(bad && bad.scrollIntoView) bad.scrollIntoView({block:'center', behavior:'smooth'});
@@ -688,7 +719,7 @@ export async function mount(root, ctx){
 
   // 初始加载
   rerenderAll();
-  loadAll().then(()=>{ rerenderAll(); updateBulkBar(); }).catch(err=>{ S.error=err.message||String(err); rerenderAll(); });
+  loadAll().then(()=>{ rerenderAll(); updateBulkBar(); }).catch(err=>{ S.error=humanError(err); rerenderAll(); });
   const poll = setInterval(()=>{ if(!S.busy){ loadDb().then(()=>{ if(S.tab==='library'||S.tab==='activity') rerenderTab(); }).catch(()=>{}); } }, 20000);
 
   return ()=>{ disposed=true; clearInterval(poll); wrap.remove(); };
@@ -836,9 +867,92 @@ const CSS = `
 .zg-app .cand.picked{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-soft)}
 .zg-app .cand-year{color:var(--muted);font-size:11px}
 .zg-app .cand-exact{margin-left:auto;font-size:9px;font-weight:600;padding:3px 7px;border-radius:6px;background:var(--accent-soft);color:var(--accent)}
+
+/* ===== 平板：左侧竖栏保留，内容改单列，避免两列表单被压扁 ===== */
+@media (max-width:900px){
+.zg-app .zg-main{padding:0 26px 56px}
+.zg-app .zg-header{min-height:84px}
+.zg-app .zg-form{grid-template-columns:minmax(0,1fr);padding:22px}
+.zg-app .page-title{padding:18px 0 22px}
+.zg-app .page-title h1{font-size:23px}
+.zg-app .zg-grid{grid-template-columns:repeat(auto-fill,minmax(132px,1fr));gap:24px 16px}
+}
+
+/* ===== 手机：竖栏转顶部横向导航，全部单列铺满 ===== */
+@media (max-width:680px){
+.zg-app{min-height:100vh;min-height:100dvh;overflow-x:hidden;-webkit-text-size-adjust:100%}
+.zg-app .zg-shell{grid-template-columns:minmax(0,1fr);min-height:100vh;min-height:100dvh}
+/* 92px 竖栏在手机上占掉四分之一宽度，改成可横向滑动的顶部条 */
+.zg-app .zg-rail{position:sticky;top:0;height:auto;max-height:none;flex-direction:row;align-items:center;justify-content:flex-start;gap:2px;padding:7px 8px;border-radius:0 0 18px 18px;border-left:1px solid var(--glass-edge);overflow-x:auto;overflow-y:hidden;scrollbar-width:none;-webkit-overflow-scrolling:touch}
+.zg-app .zg-rail::-webkit-scrollbar{display:none}
+.zg-app .zg-mark{width:32px;height:32px;border-radius:10px;font-size:13px;margin:0 8px 0 2px;flex:none;letter-spacing:0}
+.zg-app .zg-tab{flex:1 0 auto;width:auto;min-width:0;padding:6px 11px;flex-direction:row;gap:5px;border-radius:10px;font-size:11px;white-space:nowrap}
+.zg-app .zg-ico{font-size:15px}
+.zg-app .zg-main{padding:0 15px calc(44px + env(safe-area-inset-bottom))}
+.zg-app .zg-header{min-height:0;flex-direction:column;align-items:flex-start;gap:9px;padding:13px 0 2px}
+.zg-app .zg-header-side{margin-left:0;width:100%;gap:10px}
+.zg-app .zg-title h1{font-size:19px}
+.zg-app .zg-title p{font-size:10.5px}
+.zg-app .instance-pill{flex:0 0 auto;align-self:flex-start;min-height:32px;padding:0 12px;font-size:10.5px}
+.zg-app .alert{font-size:11.5px;padding:10px 12px;border-radius:11px;margin-bottom:12px}
+.zg-app .zg-toolbar{flex-direction:column;align-items:stretch;gap:10px;margin-bottom:16px}
+.zg-app .zg-chips{flex-wrap:nowrap;overflow-x:auto;gap:2px;padding:4px;border-radius:14px;scrollbar-width:none;-webkit-mask-image:linear-gradient(90deg,#000 calc(100% - 18px),transparent);mask-image:linear-gradient(90deg,#000 calc(100% - 18px),transparent)}
+.zg-app .zg-chips::-webkit-scrollbar{display:none}
+.zg-app .zg-chip{flex:none;padding:0 11px;font-size:11.5px}
+.zg-app .zg-search{max-width:none;min-width:0;gap:8px}
+.zg-app .zg-search .zg-input{flex:1 1 0;min-width:0}
+.zg-app .zg-search .zg-select{flex:none;max-width:40%}
+.zg-app .zg-go{flex:none;padding:0 15px}
+.zg-app .zg-bulk{gap:8px;padding:9px 11px;margin-bottom:16px}
+.zg-app .zg-checkall{flex:1 0 100%;font-size:11.5px}
+.zg-app .zg-bulk .zg-btn{flex:1 1 0;min-width:0;padding:10px 8px;font-size:11.5px}
+.zg-app .zg-grid{grid-template-columns:repeat(auto-fill,minmax(102px,1fr));gap:20px 12px}
+.zg-app .poster{border-radius:11px}
+.zg-app .card-meta{padding-top:9px}
+.zg-app .card-meta h3{font-size:11.5px}
+.zg-app .card-meta p{font-size:10px}
+.zg-app .card-plus{display:none}
+.zg-app .zg-more .zg-btn{width:100%}
+.zg-app .zg-foot{flex-direction:column;gap:4px;font-size:10px;margin-top:20px}
+.zg-app .page-title{padding:15px 0 18px}
+.zg-app .page-title h1{font-size:20px;margin:6px 0}
+.zg-app .page-title p{font-size:11px;line-height:1.6}
+.zg-app .zg-form{padding:16px;border-radius:18px;gap:0}
+.zg-app .zg-field{margin-bottom:16px;gap:7px}
+.zg-app .zg-label{font-size:11px}
+.zg-app .zg-hint,.zg-app .zg-err{font-size:10.5px;line-height:1.5}
+/* iOS 在 16px 以下的输入框聚焦时会强制放大整页，这里统一抬到 16px */
+.zg-app .zg-input,.zg-app .zg-select,.zg-app select{font-size:16px;min-height:46px}
+.zg-app .zg-check{font-size:11.5px;padding:7px 10px}
+.zg-app .switch-label{font-size:11.5px}
+.zg-app .zg-switch .slider{width:42px;height:24px}
+.zg-app .zg-switch .slider::after{width:18px;height:18px}
+.zg-app .zg-switch input:checked+.slider::after{transform:translateX(18px)}
+.zg-app .zg-actions{gap:9px;margin-top:12px}
+.zg-app .zg-actions .zg-btn{flex:1 1 calc(50% - 5px);min-width:0;padding:10px 8px;font-size:11.5px}
+.zg-app .zg-actions .zg-btn:first-child{flex-basis:100%}
+.zg-app .zg-sub{margin:18px 0 9px;font-size:12px}
+.zg-app .zg-logs{padding:2px 13px;border-radius:14px;max-height:none}
+.zg-app .log-item{flex-direction:column;gap:2px;padding:9px 0;font-size:11.5px}
+.zg-app .zg-runs{padding:2px 13px;border-radius:14px}
+.zg-app .run-item{flex-wrap:wrap;gap:6px 10px;padding:10px 0}
+.zg-app .run-title{flex:1 1 165px}
+.zg-app .run-sub{white-space:normal}
+.zg-app .zg-toast{bottom:18px;width:calc(100vw - 32px);max-width:none;padding:11px 18px;font-size:11.5px;justify-content:center;border-radius:16px}
+/* 详情弹窗改底部抽屉：手机上居中弹窗会被首页地址栏和软键盘顶掉 */
+.zg-app .zg-dialog{align-items:flex-end;padding:0}
+.zg-app .zg-dialog-card{width:100%;max-height:90vh;max-height:90dvh;padding:20px 17px calc(22px + env(safe-area-inset-bottom));border-radius:22px 22px 0 0;border-bottom:0}
+.zg-app .zg-close{top:12px;right:12px;width:30px;height:30px}
+.zg-app .dlg-top{gap:14px}
+.zg-app .dlg-top .poster{width:82px;border-radius:10px}
+.zg-app .dlg-top h2{font-size:16.5px;padding-right:26px}
+.zg-app .dlg-top p{font-size:11px}
+.zg-app .dlg-notice{font-size:10.5px}
+.zg-app .cand{font-size:11.5px;padding:10px 11px}
+}
 `;
 
 function iconGlyph(name){
-  const m={compass:'◎',bookmark:'▾',sliders:'⚙',activity:'⟳',search:'⌕',arrow:'→',film:'▣',star:'★',check:'✓',plus:'＋'};
+  const m={compass:'◎',bookmark:'☰',sliders:'⚙',activity:'⟳',search:'⌕',arrow:'→',film:'▣',star:'★',check:'✓',plus:'＋'};
   return m[name]||'•';
 }
