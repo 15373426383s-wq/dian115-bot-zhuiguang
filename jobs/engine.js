@@ -22,9 +22,18 @@ export async function run(ctx,input={}){
   const synced=await reconcile(ctx);
   let pool=synced; // 本轮回传的订阅池快照；新建意图会并入，避免同轮内同 identity 重复创建
   if(input.action==='sync')return {synced:true};
+  if(input.action==='auto')return discover(ctx,pool,{force:true}); // 立即追新：手动触发，跳过间隔门控
+  return discover(ctx,pool,{force:false}); // 周期运行（保留间隔门控）
+  }finally{
+    await saveDetailCache(ctx)
+  }
+}
+// 自动发现 + 按规则订阅。force=true 为手动「立即追新」（忽略间隔门控）；false 为周期运行。
+async function discover(ctx,pool,{force=false}={}){
   const c=await config(ctx),s=(await state(ctx)).value;
   if(Object.values(s.records).some(r=>['unknown','submitting','attention','delete_unknown','deleting'].includes(r.status)))return {attention:true};
-  if(!c.auto||Date.now()-s.lastAuto<c.intervalMinutes*60000)return {skipped:true};
+  if(!c.auto)return {skipped:'请先在「追新规则」开启自动追新'};
+  if(!force&&Date.now()-s.lastAuto<c.intervalMinutes*60000)return {skipped:true};
   await ensureInstance(ctx,c.proxyId);
   const fresh=await refreshCatalog(ctx,Object.keys(FEEDS).filter(f=>c.feeds[f]),c.pageCount);
   // Failed feeds preserve display caches but cached items never enter this automatic run.
@@ -67,8 +76,5 @@ export async function run(ctx,input={}){
   await change(ctx,x=>{x.lastAuto=Date.now();x.autoCursor=cursor;addLog(x,`追新检查完成：新增 ${created} 条，${failed} 项需稍后检查`);});
   await ctx.task.update({total:works.length,done,failed,message:`追新完成：新增 ${created} 条`});
   await ctx.task.checkpoint({kind:'done',result:{done,failed,created}});return {done,failed,created};
-  }finally{
-    await saveDetailCache(ctx)
-  }
 }
 export async function recover(ctx,checkpoint){return recoverMutation(ctx,checkpoint);}
