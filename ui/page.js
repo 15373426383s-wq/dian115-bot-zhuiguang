@@ -7,6 +7,8 @@
 const FEEDS = {'douban-tv':'豆瓣剧集','douban-movie':'豆瓣电影','douban-soon':'豆瓣即将上映',bangumi:'Bangumi 新番'};
 const WEEKDAYS = ['周一','周二','周三','周四','周五','周六','周日'];
 const STATUS_NAMES = {prepared:'待提交',submitting:'正在提交',unknown:'结果待核对',active:'追更中',complete:'已入库',blocked:'已停订',attention:'需人工核对',deleting:'正在停订',delete_unknown:'删除待核对'};
+const JOB_NAMES = {browse:'发现与媒体匹配', engine:'追新订阅与核对'};
+const TASK_STATES = {queued:'排队中', running:'运行中', succeeded:'成功', failed:'失败', cancelled:'已取消', attention_required:'需核对'};
 const HOST_NAMES = {pending:'等待资源',searching:'搜索资源',transferring:'转存中',partial:'部分入库',caught_up:'已追平',landed:'已入库',failed:'等待处理',expired:'已结束'};
 const DEFAULT_CONFIG = ()=>({proxyId:null,proxyName:'',auto:false,intervalMinutes:60,feeds:{'douban-tv':true,'douban-movie':true,'douban-soon':true,bangumi:true},minScore:7,minVotes:0,yearFrom:new Date().getFullYear(),include:'',exclude:'',pageCount:2,minWish:5000,soonWindowDays:30});
 const INITIAL_STATE = ()=>({version:1,records:{},blocks:{},catalog:{},review:{},logs:[],lastSync:0,lastAuto:0});
@@ -31,6 +33,7 @@ function el(tag, props, children){
 }
 function clear(node){ while(node.firstChild) node.removeChild(node.firstChild); return node; }
 function fmtTime(t){ return t? new Date(t).toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}):'尚未同步'; }
+function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
 export async function mount(root, ctx){
   let disposed = false;
@@ -71,13 +74,14 @@ export async function mount(root, ctx){
   }
 
   // ---- 封面代理（统一走宿主，并发受限，避免防盗链导致“图片显示不全”也避免打爆宿主） ----
-  const _imgCache = new Map();   // url -> dataUrl | null
+  const _imgCache = new Map();   // url -> dataUrl（只存成功结果）
   const _imgWait = new Map();    // url -> [apply...]（同一地址的重渲染复用一次请求）
-  const _imgQueue = []; let _imgActive = 0; const IMG_CONC = 6;
-  // 所有封面都必须经过队列：直接并发请求会被宿主代理限流成 400，表现就是“图片显示不全”。
+  const _imgTries = new Map();   // url -> 已失败次数（失败不写缓存，给后续重试机会）
+  const _imgQueue = []; let _imgActive = 0; const IMG_CONC = 4;
+  // 所有封面都必须经过队列：直接并发请求会被宿主代理限流，表现就是“图片显示不全”。
   function enqueueCover(url, apply){
     if(!url || disposed) return;
-    if(_imgCache.has(url)){ const hit=_imgCache.get(url); if(hit) apply(hit); return; }
+    if(_imgCache.has(url)){ apply(_imgCache.get(url)); return; }
     if(_imgWait.has(url)){ _imgWait.get(url).push(apply); return; }
     _imgWait.set(url, [apply]); _imgQueue.push(url); pumpCovers();
   }
@@ -85,9 +89,17 @@ export async function mount(root, ctx){
     while(_imgActive < IMG_CONC && _imgQueue.length){
       const url = _imgQueue.shift(); _imgActive++;
       doProxy(url).then(d=>{
-        _imgCache.set(url, d);
-        const waiting = _imgWait.get(url) || []; _imgWait.delete(url);
-        if(!disposed) waiting.forEach(fn=>{ try{ fn(d); }catch(e){} });
+        if(d){
+          _imgCache.set(url, d); _imgTries.delete(url);
+          const waiting = _imgWait.get(url) || []; _imgWait.delete(url);
+          if(!disposed) waiting.forEach(fn=>{ try{ fn(d); }catch(e){} });
+          return;
+        }
+        // 失败不写缓存：原先把 null 缓存下来，订阅页复用同一地址时会直接放弃，图就永远空白。
+        const tries = (_imgTries.get(url)||0) + 1; _imgTries.set(url, tries);
+        if(tries < 3 && !disposed){ _imgQueue.push(url); return; }
+        const waiting = _imgWait.get(url) || []; _imgWait.delete(url); _imgTries.delete(url);
+        if(!disposed) waiting.forEach(fn=>{ try{ fn(null); }catch(e){} });
       }).finally(()=>{ _imgActive--; pumpCovers(); });
     }
   }
@@ -100,17 +112,33 @@ export async function mount(root, ctx){
       .replace('/view/photo/l_ratio_poster/', '/view/photo/m_ratio_poster/')
       .replace('/view/photo/l/public/', '/view/photo/m/public/');
   }
+  // 豆瓣图片同一 path 在多个 img 节点、多种尺寸规格下等价。
+  // 宿主出口偶尔被某个 CDN 节点要求验证（返回 200 + text/html），换节点/换规格基本都能拿到真图。
+  function coverVariants(rawUrl){
+    const base = shrinkCover(rawUrl);
+    const list = [base];
+    const host = /^(https?:\/\/)img\d\.doubanio\.com\/(.+)$/.exec(base);
+    if(host){ ['1','2','3'].forEach(n=>list.push(`${host[1]}img${n}.doubanio.com/${host[2]}`)); }
+    const ratio = base.match(/\/view\/photo\/[sml]_ratio_poster\//);
+    if(ratio){ ['m','l'].forEach(c=>list.push(base.replace(ratio[0], `/view/photo/${c}_ratio_poster/`))); }
+    const sized = base.match(/\/pic\/cover\/[csml]\//);
+    if(sized){ ['c','m','l'].forEach(c=>list.push(base.replace(sized[0], `/pic/cover/${c}/`))); }
+    return [...new Set(list)];
+  }
   async function doProxy(rawUrl){
-    const url = shrinkCover(rawUrl);
-    const referer = url.includes('doubanio.com') ? 'https://movie.douban.com/' : 'https://bgm.tv/';
-    for(let attempt=0; attempt<2; attempt++){
-      try{
-        const r = await ctx.http.request({url, headers:{Referer:referer,'User-Agent':'Mozilla/5.0'}, response_type:'base64', timeout_seconds:20, max_bytes:6*1024*1024, cache_seconds:86400, session:'public-covers'});
-        const ct = pickContentType(r);
-        if(r.status===200 && /^image\//.test(ct) && r.body_base64) return `data:${ct};base64,${r.body_base64}`;
-      }catch(e){}
-      await sleep(300*(attempt+1));
+    const referer = String(rawUrl).includes('doubanio.com') ? 'https://movie.douban.com/' : 'https://bgm.tv/';
+    const variants = coverVariants(rawUrl);
+    for(let vi=0; vi<variants.length; vi++){
       if(disposed) return null;
+      const url = variants[vi];
+      for(let attempt=0; attempt<2; attempt++){
+        try{
+          const r = await ctx.http.request({url, headers:{Referer:referer,'User-Agent':'Mozilla/5.0'}, response_type:'base64', timeout_seconds:20, max_bytes:6*1024*1024, cache_seconds:86400, session:'public-covers'});
+          const ct = pickContentType(r);
+          if(r.status===200 && /^image\//.test(ct) && r.body_base64) return `data:${ct};base64,${r.body_base64}`;
+        }catch(e){}
+        await sleep(200*(attempt+1));
+      }
     }
     return null;
   }
@@ -135,20 +163,36 @@ export async function mount(root, ctx){
   }
 
   // ---- 配置校验（与后端 normalizeConfig 对齐） ----
-  function normalizeConfig(raw){
-    const c = Object.assign(DEFAULT_CONFIG(), raw||{}, {feeds:Object.assign({'douban-tv':true,'douban-movie':true,'douban-soon':true,bangumi:true}, (raw&&raw.feeds)||{})});
-    if(c.proxyId!==null && (!Number.isSafeInteger(c.proxyId)||c.proxyId<=0)) throw new Error('请选择具有独立 ID 的固定 Emby 实例');
-    if(c.auto && !c.proxyId) throw new Error('启用自动追新前，请先选择固定 Emby 实例');
-    if(!Number.isFinite(Number(c.minWish))) c.minWish=5000;
-    if(!Number.isFinite(Number(c.soonWindowDays))) c.soonWindowDays=30;
-    for(const [k,min,max] of [['minScore',0,10],['minVotes',0,1000000],['yearFrom',1900,2100],['intervalMinutes',15,1440],['pageCount',1,5],['minWish',0,1000000],['soonWindowDays',1,365]])
-      if(!Number.isFinite(Number(c[k]))||Number(c[k])<min||Number(c[k])>max) throw new Error('筛选设置超出范围');
-    for(const k of ['minVotes','yearFrom','intervalMinutes','pageCount','minWish','soonWindowDays']) c[k]=Math.trunc(Number(c[k]));
-    c.minScore=Number(c.minScore); c.auto=!!c.auto;
+  // 字段级校验：一次性收集所有问题，指明是哪一项、允许范围、当前值。
+  const CONFIG_RULES = [
+    ['minScore','最低评分',0,10,'float'],
+    ['minVotes','最低投票数',0,1000000,'int'],
+    ['yearFrom','起始年份',1900,2100,'int'],
+    ['intervalMinutes','检查间隔（分钟）',15,1440,'int'],
+    ['pageCount','豆瓣片单读取页数',1,5,'int'],
+    ['minWish','即将上映·想看人数阈值',0,1000000,'int'],
+    ['soonWindowDays','即将上映·上映窗口(天)',1,365,'int']
+  ];
+  function validateConfig(raw){
+    const base = DEFAULT_CONFIG();
+    const c = Object.assign({}, base, raw||{}, {feeds:Object.assign({}, base.feeds, (raw&&raw.feeds)||{})});
+    const issues = [];
+    CONFIG_RULES.forEach(([key,label,min,max,kind])=>{
+      const rawV = c[key];
+      const n = (rawV===''||rawV===null||rawV===undefined)?NaN:Number(rawV);
+      if(!Number.isFinite(n)){ issues.push({key,msg:`${label}需要填写数字（${min}–${max}）`}); c[key]=base[key]; return; }
+      if(n<min||n>max){ issues.push({key,msg:`${label}需在 ${min}–${max} 之间，你填的是 ${n}`}); c[key]=base[key]; return; }
+      c[key] = kind==='int' ? Math.trunc(n) : n;
+    });
+    c.proxyId = (c.proxyId==null||c.proxyId==='') ? null : Number(c.proxyId);
+    if(c.proxyId!==null && (!Number.isSafeInteger(c.proxyId)||c.proxyId<=0)){ issues.push({key:'proxyId',msg:'请选择具有独立 ID 的固定 Emby 实例'}); c.proxyId=null; }
+    c.auto = !!c.auto;
+    if(c.auto && !c.proxyId) issues.push({key:'auto',msg:'启用自动追新前，请先选择固定 Emby 实例'});
     c.include=String(c.include||'').slice(0,200); c.exclude=String(c.exclude||'').slice(0,200); c.proxyName=String(c.proxyName||'').slice(0,160);
     c.feeds=Object.fromEntries(Object.keys(FEEDS).map(k=>[k,!!c.feeds[k]]));
-    return c;
+    return {value:c, issues};
   }
+  function normalizeConfig(raw){ const r=validateConfig(raw); if(r.issues.length) throw new Error(r.issues.map(i=>i.msg).join('；')); return r.value; }
 
   // ---- 应用状态 ----
   const S = {
@@ -157,7 +201,7 @@ export async function mount(root, ctx){
     busy:false, error:'', toast:'', lastFetch:0, sourceErrors:[],
     selection:new Set(), // 发现页勾选的作品 sourceKey 集合
     detail:null, candidates:[], matchQuery:'', seasons:[], season:0, notice:'', restore:false,
-    confirmStop:null, dialogOpen:false, dirty:false,
+    confirmStop:null, dialogOpen:false, dirty:false, fieldErrors:{},
   };
 
   // ---- 数据加载 ----
@@ -220,12 +264,26 @@ export async function mount(root, ctx){
     toast('已停订，不会自动重新添加'); closeDialog(); await loadDb();
   }
   async function saveRules(){
-    const v = normalizeConfig(S.config);
-    const inst = S.emby.find(j=>j.id===v.proxyId && j.api_key_configured);
-    if(v.proxyId && !inst) throw new Error('所选 Emby 实例不可用，请刷新实例列表');
-    v.proxyName = inst?inst.name:'';
+    const {value:v, issues} = validateConfig(S.config);
+    if(issues.length){
+      S.fieldErrors = {};
+      issues.forEach(i=>{ if(i.key) S.fieldErrors[i.key]=i.msg; });
+      throw new Error(`有 ${issues.length} 项不符合要求，已在对应字段下方标出：` + issues.map(i=>i.msg).join('；'));
+    }
+    S.fieldErrors = {};
+    const inst = v.proxyId ? S.emby.find(j=>j.id===v.proxyId) : null;
+    if(v.proxyId && !inst) throw new Error(`找不到 ID 为 ${v.proxyId} 的 Emby 实例，请在宿主确认实例存在后刷新本页重选`);
+    if(v.proxyId && !inst.api_key_configured) throw new Error(`实例「${inst.name}」还没有配置 API 密钥，无法作为固定实例`);
+    v.proxyName = inst ? inst.name : '';
     await apiPut('config', ()=>Object.assign({}, v), DEFAULT_CONFIG());
-    S.config = v; S.dirty=false; toast('规则已保存；已有订阅继续使用原来的固定实例');
+    // 回读确认：宿主若静默丢弃写入，这里直接报出来，不再“看起来保存了其实没存”。
+    const back = await apiGet('config', DEFAULT_CONFIG());
+    const keys = ['proxyId','auto','minScore','minVotes','yearFrom','intervalMinutes','pageCount','minWish','soonWindowDays','include','exclude'];
+    const diff = keys.filter(k=>String(back.value[k]==null?'':back.value[k]) !== String(v[k]==null?'':v[k]));
+    if(diff.length) throw new Error('保存未生效：'+diff.join('、')+' 与提交值不一致，请重试或刷新页面');
+    S.config = Object.assign(DEFAULT_CONFIG(), back.value, {feeds:Object.assign({}, DEFAULT_CONFIG().feeds, back.value.feeds||{})});
+    S.dirty = false;
+    toast('规则已保存');
   }
   async function runAutoNow(){
     await runTask('engine', {action:'auto'}, `engine:auto:${Date.now()}`);
@@ -306,30 +364,39 @@ export async function mount(root, ctx){
   }
 
   // ---- 渲染外壳 ----
-  const wrap = el('section',{class:'zg'});
+  const wrap = el('section',{class:'zg-app'});
   const style = el('style',{text:CSS});
   wrap.append(style);
   const rail = el('nav',{class:'zg-rail glass', 'aria-label':'主导航'});
-  const tabs = [['discover','发现','compass'],['library','我的订阅','bookmark'],['rules','追新规则','sliders'],['activity','运行记录','activity']];
+  rail.append(el('div',{class:'zg-mark', 'aria-hidden':'true', text:'追'}));
+  const tabs = [['discover','发现','compass'],['library','订阅','bookmark'],['rules','规则','sliders'],['activity','记录','activity']];
   tabs.forEach(([id,label,icon])=>{
-    const b = el('button',{class:'zg-tab'+(S.tab===id?' active':''), 'aria-current':S.tab===id?'page':null, onClick:()=>switchTab(id)}, [
+    const b = el('button',{class:'zg-tab'+(S.tab===id?' active':''), 'aria-current':S.tab===id?'page':null, title:label, onClick:()=>switchTab(id)}, [
       el('span',{class:'zg-ico', text:iconGlyph(icon)}), el('span',{text:label})
     ]);
     rail.append(b);
   });
   const main = el('div',{class:'zg-main'});
-  wrap.append(rail, main);
+  const shell = el('div',{class:'zg-shell'});
+  shell.append(rail, main);
+  wrap.append(shell);
   root.append(wrap);
 
   function switchTab(id){ S.tab=id; if(id==='activity'){ loadRuns().catch(()=>{}); } if(id==='rules'){ loadEmby().catch(()=>{}); } rerenderAll(); }
   function rerenderAll(){ clear(main); main.append(renderHeader()); main.append(renderTab()); }
   function rerenderTab(){ const old = main.querySelector('.zg-tabbody'); if(old) old.remove(); main.append(renderTab()); }
   function renderHeader(){
+    const inst = S.config.proxyId ? (S.config.proxyName || ('实例 #'+S.config.proxyId)) : '未绑定实例';
     return el('header',{class:'zg-header'},[
       el('div',{class:'zg-title'},[el('h1',{text:'追光'}), el('p',{text:'豆瓣影视与 Bangumi 新番，静候更新'})]),
-      S.busy?el('span',{class:'zg-spinner'}):null,
-      S.error?el('div',{class:'alert error', text:S.error}):null,
-      S.toast?el('div',{class:'zg-toast', text:S.toast}):null
+      el('div',{class:'zg-header-side'},[
+        S.busy?el('span',{class:'zg-spinner'}):null,
+        el('span',{class:'instance-pill glass', title:'固定 Emby 实例'},[
+          el('span',{class:'status-dot'+(S.config.proxyId?'':' offline')}),
+          el('span',{html:'固定实例 · <b>'+esc(inst)+'</b>'})
+        ])
+      ]),
+      S.error?el('div',{class:'alert error', text:S.error}):null
     ]);
   }
   function renderTab(){
@@ -462,45 +529,65 @@ export async function mount(root, ctx){
     box.append(el('div',{class:'page-title'},[el('div',{class:'eyebrow',text:'RULES'}),el('h1',{text:'把期待交给规则。'}),el('p',{text:'固定一个 Emby 实例，开启自动追新，剩下的交给宿主。'})]));
     const form = el('div',{class:'zg-form glass'});
     // Emby 实例
-    const instSel = el('select',{class:'zg-input', 'aria-label':'固定 Emby 实例', onchange:(e)=>{S.config.proxyId=Number(e.target.value)||null; S.dirty=true;}});
+    const instSel = el('select',{class:'zg-input', 'aria-label':'固定 Emby 实例', onchange:(e)=>{S.config.proxyId=e.target.value?Number(e.target.value):null; S.dirty=true; clearFieldError('proxyId',e.target);}});
     instSel.append(el('option',{value:'',text:'— 请选择固定 Emby 实例 —'}));
     S.emby.forEach(j=>instSel.append(el('option',{value:String(j.id), text:j.name+(j.api_key_configured?'':'（未配置密钥）')})));
     instSel.value = S.config.proxyId!=null?String(S.config.proxyId):'';
-    form.append(field('固定 Emby 实例', instSel, '每条订阅只认定一个媒体库；实例不可用时暂停处理，不切换到其他媒体库。更改此设置只影响新订阅。'));
+    form.append(field('固定 Emby 实例', instSel, '每条订阅只认定一个媒体库；实例不可用时暂停处理，不切换到其他媒体库。更改此设置只影响新订阅。', 'proxyId'));
     // 自动追新开关
     const autoWrap = el('label',{class:'zg-switch'});
-    const autoCb = el('input',{type:'checkbox', checked:!!S.config.auto, onchange:(e)=>{S.config.auto=e.target.checked; S.dirty=true; updateRulesValidity();}});
+    const autoCb = el('input',{type:'checkbox', checked:!!S.config.auto, onchange:(e)=>{S.config.auto=e.target.checked; S.dirty=true; clearFieldError('auto',e.target); updateRulesValidity();}});
     autoWrap.append(autoCb, el('span',{class:'slider'}), el('span',{class:'switch-label', text:'启用自动追新'}));
-    form.append(field('自动追新', autoWrap, '开启后，插件按间隔自动从公开目录发现并订阅符合条件的作品（需先选择 Emby 实例）。也可随时点“立即追新”手动触发。'));
-    // 立即追新按钮
-    form.append(el('button',{class:'zg-btn primary', text:'立即追新一次', onClick:()=>busyWrap(runAutoNow).then(rerenderTab).catch(showError), disabled:S.busy}));
+    form.append(field('自动追新', autoWrap, '开启后，插件按间隔自动从公开目录发现并订阅符合条件的作品（需先选择 Emby 实例）。也可随时点“立即追新”手动触发。', 'auto'));
     // 来源
     const feedsWrap = el('div',{class:'zg-feeds'});
     Object.keys(FEEDS).forEach(f=>{ const l=el('label',{class:'zg-check'}); const c=el('input',{type:'checkbox',checked:!!S.config.feeds[f],onchange:(e)=>{S.config.feeds[f]=e.target.checked;S.dirty=true;}}); l.append(c, FEEDS[f]); feedsWrap.append(l); });
     form.append(field('订阅来源', feedsWrap, '豆瓣剧集 / 豆瓣电影 / Bangumi 新番。'));
     // 筛选
-    form.append(field('最低评分', numInput('minScore',0,10,0.1)));
-    form.append(field('最低投票数', numInput('minVotes',0,1000000,1)));
-    form.append(field('起始年份', numInput('yearFrom',1900,2100,1)));
-    form.append(field('仅包含关键词', textInput('include','如：科幻,悬疑')));
-    form.append(field('排除关键词', textInput('exclude','如：真人秀')));
-    form.append(field('检查间隔（分钟）', numInput('intervalMinutes',15,1440,5)));
-    form.append(field('豆瓣片单读取页数', numInput('pageCount',1,5,1)));
+    form.append(field('最低评分', numInput('minScore',0,10,0.1), '0–10，豆瓣评分/新番评分门槛', 'minScore'));
+    form.append(field('最低投票数', numInput('minVotes',0,1000000,1), '0–1000000', 'minVotes'));
+    form.append(field('起始年份', numInput('yearFrom',1900,2100,1), '1900–2100', 'yearFrom'));
+    form.append(field('仅包含关键词', textInput('include','如：科幻,悬疑'), '逗号分隔，命中任一即保留', 'include'));
+    form.append(field('排除关键词', textInput('exclude','如：真人秀'), '逗号分隔，命中即跳过', 'exclude'));
+    form.append(field('检查间隔（分钟）', numInput('intervalMinutes',15,1440,5), '15–1440 分钟，仅在开启自动追新时生效', 'intervalMinutes'));
+    form.append(field('豆瓣片单读取页数', numInput('pageCount',1,5,1), '1–5 页，页数越多抓取越慢', 'pageCount'));
     // 即将上映（豆瓣即将上映）专用筛选：按「想看人数阈值」+「上映窗口」过滤（评分/投票不适用）
-    form.append(field('即将上映·想看人数阈值', numInput('minWish',0,1000000,100)));
-    form.append(field('即将上映·上映窗口(天)', numInput('soonWindowDays',1,365,1)));
+    form.append(field('即将上映·想看人数阈值', numInput('minWish',0,1000000,100), '0–1000000，低于此值不自动订阅', 'minWish'));
+    form.append(field('即将上映·上映窗口(天)', numInput('soonWindowDays',1,365,1), '1–365 天，只追这段时间内上映的', 'soonWindowDays'));
     box.append(form);
     box.append(el('div',{class:'zg-actions'},[
       el('button',{class:'zg-btn primary', text:'保存规则', onClick:()=>busyWrap(saveRules).then(rerenderTab).catch(showError), disabled:S.busy}),
+      el('button',{class:'zg-btn', text:'立即追新一次', onClick:()=>busyWrap(runAutoNow).then(rerenderTab).catch(showError), disabled:S.busy}),
       el('button',{class:'zg-btn', text:'核对宿主订阅', onClick:()=>busyWrap(syncNow).then(rerenderTab).catch(showError), disabled:S.busy})
     ]));
     updateRulesValidity();
     return box;
   }
-  function field(label, control, hint){ return el('div',{class:'zg-field'},[el('label',{class:'zg-label',text:label}), control, hint?el('p',{class:'zg-hint',text:hint}):null]); }
-  function numInput(key,min,max,step){ const i=el('input',{class:'zg-input',type:'number',value:Number(S.config[key]),min,max,step,oninput:(e)=>{S.config[key]=Number(e.target.value);S.dirty=true;updateRulesValidity();}}); return i; }
-  function textInput(key,ph){ return el('input',{class:'zg-input',type:'text',value:String(S.config[key]||''),placeholder:ph,oninput:(e)=>{S.config[key]=e.target.value;S.dirty=true;}}); }
-  function updateRulesValidity(){ const btn = main.querySelector('.zg-actions .primary'); }
+  function field(label, control, hint, key){
+    const err = key && S.fieldErrors ? S.fieldErrors[key] : '';
+    return el('div',{class:'zg-field'+(err?' invalid':''), 'data-field':key||null},[
+      el('label',{class:'zg-label',text:label}), control,
+      hint?el('p',{class:'zg-hint',text:hint}):null,
+      err?el('p',{class:'zg-err',text:err}):null
+    ]);
+  }
+  function clearFieldError(key, node){
+    if(!S.fieldErrors || !S.fieldErrors[key]) return;
+    delete S.fieldErrors[key];
+    const f = node && node.closest ? node.closest('.zg-field') : null;
+    if(f){ f.classList.remove('invalid'); const e=f.querySelector('.zg-err'); if(e) e.remove(); }
+    if(S.error && /不符合要求|需在|需要填写/.test(S.error)){ S.error=''; rerenderHeaderOnly(); }
+  }
+  function numInput(key,min,max,step){
+    const raw = S.config[key];
+    return el('input',{class:'zg-input',type:'number',value:(raw==null||raw==='')?'':String(raw),min,max,step,
+      oninput:(e)=>{ S.config[key]=e.target.value; S.dirty=true; clearFieldError(key,e.target); updateRulesValidity(); }});
+  }
+  function textInput(key,ph){
+    return el('input',{class:'zg-input',type:'text',value:String(S.config[key]==null?'':S.config[key]),placeholder:ph,
+      oninput:(e)=>{ S.config[key]=e.target.value; S.dirty=true; clearFieldError(key,e.target); }});
+  }
+  function updateRulesValidity(){}
 
   // ---- 运行记录 ----
   function renderActivity(){
@@ -510,13 +597,22 @@ export async function mount(root, ctx){
     const logs = (S.db.logs||[]).slice(0,40);
     box.append(el('h3',{class:'zg-sub',text:'日志'}));
     const logBox = el('div',{class:'zg-logs glass'});
-    if(!logs.length) logBox.append(el('div',{class:'zg-empty small',text:'暂无日志'}));
+    if(!logs.length) logBox.append(el('div',{class:'zg-empty small',text:'暂无日志 · 每次追新与核对都会记录在这里'}));
     logs.forEach(l=>logBox.append(el('div',{class:'log-item '+(l.level==='warning'?'warn':'')},[el('span',{class:'log-time',text:fmtTime(l.at)}), el('span',{class:'log-msg',text:l.message})])));
     box.append(logBox);
     box.append(el('h3',{class:'zg-sub',text:'运行任务'}));
     const runsBox = el('div',{class:'zg-runs glass'});
     if(!S.runs.length) runsBox.append(el('div',{class:'zg-empty small',text:'暂无运行记录'}));
-    S.runs.forEach(t=>runsBox.append(el('div',{class:'run-item'},[el('span',{class:'run-title',text:(t.title||t.id||'任务')}), el('span',{class:'run-status '+t.status,text:t.status}), t.status==='attention_required'?el('button',{class:'zg-btn small',text:'恢复核对',onClick:()=>busyWrap(()=>retryRun(t.id)).catch(showError)},):null])));
+    S.runs.forEach(t=>{
+      const name = JOB_NAMES[t.job_id] || t.job_id || '任务';
+      const res = t.result && t.result.created!=null ? `新增 ${t.result.created} 条` : (t.result && t.result.done!=null ? `处理 ${t.result.done} 项` : '');
+      const sub = [fmtTime(t.created_at), res, t.attempted>1?`第 ${t.attempted} 次`:'', t.status==='failed'?(t.message||'').slice(0,40):''].filter(Boolean).join(' · ');
+      runsBox.append(el('div',{class:'run-item'},[
+        el('span',{class:'run-title'},[el('b',{text:name}), el('span',{class:'run-sub',text:sub||'—'})]),
+        el('span',{class:'run-status '+t.status,text:TASK_STATES[t.status]||t.status}),
+        t.status==='attention_required'?el('button',{class:'zg-btn small',text:'恢复核对',onClick:()=>busyWrap(()=>retryRun(t.id)).catch(showError)}):null
+      ]));
+    });
     box.append(runsBox);
     return box;
   }
@@ -574,9 +670,21 @@ export async function mount(root, ctx){
 
   // ---- 小工具 ----
   async function busyWrap(fn){ S.busy=true; S.error=''; rerenderHeaderOnly(); try{ return await fn(); } finally { S.busy=false; rerenderHeaderOnly(); } }
-  function showError(err){ S.error=(err&&err.message)||String(err); S.busy=false; rerenderHeaderOnly(); rerenderTab(); }
+  function showError(err){
+    S.error=(err&&err.message)||String(err); S.busy=false;
+    rerenderHeaderOnly(); rerenderTab();
+    const bad = main.querySelector('.zg-field.invalid');
+    if(bad && bad.scrollIntoView) bad.scrollIntoView({block:'center', behavior:'smooth'});
+  }
   function rerenderHeaderOnly(){ const old=main.querySelector('.zg-header'); if(old){ const h=renderHeader(); old.replaceWith(h); } else main.prepend(renderHeader()); }
-  function toast(msg){ S.toast=msg; const old=main.querySelector('.zg-toast'); if(old) old.remove(); main.querySelector('.zg-header').append(el('div',{class:'zg-toast',text:msg})); setTimeout(()=>{ S.toast=''; const t=main.querySelector('.zg-toast'); if(t) t.remove(); }, 4200); }
+  function toast(msg){
+    // 挂在 .zg-app 上而不是 header 里：每次操作后 header 会整块重渲染，挂里面会被一起删掉，
+    // 表现就是“点了保存什么提示都没有”，误以为保存失效。
+    S.toast=msg;
+    const old=wrap.querySelector('.zg-toast'); if(old) old.remove();
+    wrap.append(el('div',{class:'zg-toast',text:msg}));
+    setTimeout(()=>{ S.toast=''; const t=wrap.querySelector('.zg-toast'); if(t) t.remove(); }, 6000);
+  }
 
   // 初始加载
   rerenderAll();
@@ -588,114 +696,146 @@ export async function mount(root, ctx){
 
 // ---- 静态资源 ----
 const CSS = `
-.zg{background:var(--app-bg,#0f1115);color:var(--app-text,#e8eaf0);min-height:100%;display:flex;gap:0;padding:0;box-sizing:border-box;font:14px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif}
-.zg *{box-sizing:border-box}
-.zg-rail{position:sticky;top:0;align-self:flex-start;width:188px;min-height:100vh;padding:18px 12px;display:flex;flex-direction:column;gap:6px}
-.zg-tab{display:flex;align-items:center;gap:10px;width:100%;padding:11px 14px;border:none;border-radius:12px;background:transparent;color:var(--app-text-secondary,#9aa3b2);font:inherit;font-weight:600;cursor:pointer;text-align:left}
-.zg-tab:hover{color:var(--app-text,#e8eaf0);background:var(--app-surface,#1a1d24)}
-.zg-tab.active{color:#fff;background:var(--app-accent,#7c5cff)}
-.zg-ico{font-style:normal;display:inline-block}
-.zg-ico.big{font-size:40px;opacity:.5}
-.zg-main{flex:1;min-width:0;padding:18px 22px 60px}
-.zg-header{display:flex;align-items:center;gap:14px;margin:0 0 16px;min-height:34px}
-.zg-title h1{margin:0;font-size:22px;font-weight:700}
-.zg-title p{margin:2px 0 0;color:var(--app-text-secondary,#9aa3b2);font-size:13px}
-.zg-spinner{width:18px;height:18px;border:2px solid var(--app-border,#2a2f3a);border-top-color:var(--app-accent,#7c5cff);border-radius:50%;animation:zg-spin .8s linear infinite}
+.zg-app{--bg:#f5f7f5;--surface:#fff;--text:#203b39;--muted:#5c706d;--border:#dbe5e0;--accent:#0d7569;--accent-soft:#e0eee8;--glass:rgba(255,255,255,.68);--glass-edge:rgba(255,255,255,.95);--shadow:0 12px 40px -22px #385c4b38;--error:#a83239;--warm:#85591f;color:var(--text);background:var(--bg);font:14px/1.55 -apple-system,BlinkMacSystemFont,"SF Pro Display","PingFang SC","Microsoft YaHei",sans-serif;min-height:100vh;color-scheme:light;isolation:isolate;-webkit-font-smoothing:antialiased}
+.zg-app *{box-sizing:border-box}
+.zg-app[data-theme=dark]{--bg:#121d20;--surface:#1c2c2e;--text:#e6efea;--muted:#a4bab5;--border:#3b504e;--accent:#a0e0cb;--accent-soft:#2b4943;--glass:rgba(34,52,54,.8);--glass-edge:rgba(255,255,255,.07);--shadow:0 12px 40px -22px #00000080;--error:#ff9aa0;--warm:#e4bd86;color-scheme:dark}
+.zg-shell{max-width:1920px;margin:0 auto;display:grid;grid-template-columns:92px minmax(0,1fr);min-height:100vh;background:radial-gradient(ellipse at 15% 0%,#dae8dc70,transparent 40%),radial-gradient(ellipse at 100% 30%,#e4e9db60,transparent 50%)}
+.zg-app[data-theme=dark] .zg-shell{background:radial-gradient(ellipse at 15% 0%,#1b303380,transparent 42%),radial-gradient(ellipse at 100% 30%,#16262a70,transparent 50%)}
+.zg-app .glass{background:var(--glass);border:1px solid var(--glass-edge);box-shadow:var(--shadow),inset 0 1px 0 var(--glass-edge);backdrop-filter:blur(24px) saturate(135%);-webkit-backdrop-filter:blur(24px) saturate(135%)}
+.zg-app .zg-rail{border-radius:0 28px 28px 0;position:sticky;top:0;height:100vh;max-height:1000px;display:flex;flex-direction:column;align-items:center;gap:5px;padding:26px 8px;z-index:5;border-left:0}
+.zg-app .zg-mark{display:grid;place-items:center;width:44px;height:44px;border-radius:15px;background:linear-gradient(150deg,#216b5d,#0b423d);color:#fff;font-size:16px;font-weight:700;box-shadow:inset 0 1px #ffffff60,0 4px 10px #25524720;margin-bottom:16px;letter-spacing:1px}
+.zg-app .zg-tab{width:62px;padding:10px 0 8px;display:flex;flex-direction:column;align-items:center;gap:5px;border:0;border-radius:14px;background:transparent;color:var(--muted);font:inherit;font-size:10px;font-weight:600;cursor:pointer;transition:background .16s,color .16s}
+.zg-app .zg-tab:hover{color:var(--text);background:var(--accent-soft)}
+.zg-app .zg-tab.active{color:var(--accent);background:var(--accent-soft)}
+.zg-app .zg-ico{font-style:normal;font-size:17px;line-height:1}
+.zg-app .zg-ico.big{font-size:34px;opacity:.45}
+.zg-app .zg-main{padding:0 42px 72px;min-width:0}
+.zg-app .zg-header{min-height:100px;display:flex;align-items:center;justify-content:space-between;gap:20px;flex-wrap:wrap}
+.zg-app .zg-title h1{margin:0;font-size:21px;font-weight:650;letter-spacing:-.3px}
+.zg-app .zg-title p{margin:3px 0 0;color:var(--muted);font-size:11px;letter-spacing:.3px}
+.zg-app .zg-header-side{display:flex;align-items:center;gap:12px;margin-left:auto}
+.zg-app .instance-pill{display:flex;align-items:center;gap:8px;min-height:40px;padding:0 16px;border-radius:99px;font-size:11px;color:var(--muted);white-space:nowrap}
+.zg-app .instance-pill b{color:var(--text);font-weight:600}
+.zg-app .status-dot{width:5px;height:5px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.zg-app .status-dot.offline{background:var(--muted);box-shadow:none}
+.zg-app .zg-spinner{width:16px;height:16px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:zg-spin .8s linear infinite}
 @keyframes zg-spin{to{transform:rotate(360deg)}}
-.alert{margin:0 0 12px;padding:10px 14px;border-radius:10px;font-size:13px}
-.alert.error{background:rgba(255,90,90,.12);color:#ff8a8a;border:1px solid rgba(255,90,90,.3)}
-.alert.warn{background:rgba(255,190,90,.12);color:#ffcf8a;border:1px solid rgba(255,190,90,.3)}
-.zg-toast{margin-left:auto;padding:8px 14px;border-radius:999px;background:var(--app-surface,#1a1d24);border:1px solid var(--app-border,#2a2f3a);font-size:13px;color:var(--app-text,#e8eaf0)}
-.zg-toolbar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:0 0 12px}
-.zg-chips{display:flex;flex-wrap:wrap;gap:8px}
-.zg-chip{padding:7px 14px;font:inherit;color:var(--app-text-secondary,#9aa3b2);background:var(--app-surface,#1a1d24);border:1px solid var(--app-border,#2a2f3a);border-radius:999px;cursor:pointer}
-.zg-chip:hover{color:var(--app-text,#e8eaf0);border-color:var(--app-accent,#7c5cff)}
-.zg-chip.selected{color:#fff;background:var(--app-accent,#7c5cff);border-color:var(--app-accent,#7c5cff)}
-.src-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
-.src-dot.green{background:#3ecf8e}.src-dot.pink{background:#ff7ac6}
-.zg-search{display:flex;gap:8px;align-items:center}
-.zg-input{flex:1;min-width:160px;min-height:40px;padding:0 14px;font:inherit;color:inherit;background:var(--app-surface,#1a1d24);border:1px solid var(--app-border,#2a2f3a);border-radius:10px;outline:none}
-.zg-input:focus{border-color:var(--app-accent,#7c5cff)}
-.zg-select{padding:0 10px;min-height:40px;font:inherit;color:inherit;background:var(--app-surface,#1a1d24);border:1px solid var(--app-border,#2a2f3a);border-radius:10px;outline:none}
-.zg-go{min-height:40px;padding:0 18px;font:inherit;font-weight:600;color:#fff;background:var(--app-accent,#7c5cff);border:none;border-radius:10px;cursor:pointer}
-.zg-go:disabled{opacity:.5;cursor:default}
-.zg-bulk{display:flex;align-items:center;gap:12px;margin:0 0 14px;padding:8px 12px;background:var(--app-surface,#1a1d24);border:1px solid var(--app-border,#2a2f3a);border-radius:12px}
-.zg-checkall{display:flex;align-items:center;gap:6px;color:var(--app-text-secondary,#9aa3b2);font-size:13px;cursor:pointer}
-.zg-btn{padding:9px 16px;font:inherit;font-weight:600;color:var(--app-text,#e8eaf0);background:var(--app-surface,#1a1d24);border:1px solid var(--app-border,#2a2f3a);border-radius:10px;cursor:pointer}
-.zg-btn:hover{border-color:var(--app-accent,#7c5cff)}
-.zg-btn.primary{color:#fff;background:var(--app-accent,#7c5cff);border-color:var(--app-accent,#7c5cff)}
-.zg-btn.small{padding:6px 12px;font-size:13px}
-.zg-btn.danger{color:#fff;background:#e0533d;border-color:#e0533d}
-.zg-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:16px}
-.zg-more{display:flex;justify-content:center;margin:20px 0 4px}
-.media-card{position:relative;display:flex;flex-direction:column;background:var(--app-surface,#1a1d24);border:1px solid var(--app-border,#2a2f3a);border-radius:14px;overflow:hidden;transition:.15s}
-.media-card:hover{transform:translateY(-3px);border-color:var(--app-accent,#7c5cff);box-shadow:0 8px 24px rgba(0,0,0,.35)}
-.media-card.selected{border-color:var(--app-accent,#7c5cff);box-shadow:0 0 0 2px var(--app-accent,#7c5cff)}
-.card-check{position:absolute;top:8px;left:8px;z-index:3;width:22px;height:22px;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.45);border-radius:6px}
-.card-check input{width:16px;height:16px;cursor:pointer}
-.poster-btn{border:none;padding:0;background:none;cursor:pointer;display:block;width:100%}
-.poster{position:relative;width:100%;aspect-ratio:2/3;background:linear-gradient(135deg,#2a2f3a,#1a1d24);display:flex;align-items:center;justify-content:center;overflow:hidden}
-.poster.small{aspect-ratio:2/3;width:120px}
-.poster-img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:0;transition:opacity .18s}
-.poster-img.ready{opacity:1}
-.poster-fallback{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;padding:12px;text-align:center;color:var(--app-text-secondary,#9aa3b2);font-size:13px}
-.poster-fallback.hidden{display:none}
-.poster-fallback .zg-ico{font-size:30px;opacity:.5}
-.card-meta{padding:10px 12px 12px}
-.card-meta h3{margin:0;font-size:14px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.card-meta p{margin:3px 0 0;font-size:12px;color:var(--app-text-secondary,#9aa3b2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.card-meta p.sub{color:#3ecf8e}.card-meta p.err{color:#ff8a8a}
-.card-tags{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px;align-items:center}
-.src-tag{font-size:11px;padding:2px 7px;border-radius:999px;background:rgba(124,92,255,.18);color:#c9bcff}
-.src-tag.bangumi{background:rgba(255,122,198,.18);color:#ffb3e0}
-.score{display:inline-flex;align-items:center;gap:3px;font-size:12px;color:#ffcf6a}
-.badge{font-size:11px;padding:2px 7px;border-radius:999px;background:rgba(62,207,142,.16);color:#7fe3b0}
-.card-plus{position:absolute;top:8px;right:8px;z-index:3;width:30px;height:30px;border:none;border-radius:8px;background:rgba(0,0,0,.45);color:#fff;font-size:16px;cursor:pointer}
-.card-plus:hover{background:var(--app-accent,#7c5cff)}
-.zg-empty{padding:48px 20px;text-align:center;color:var(--app-text-secondary,#9aa3b2);grid-column:1/-1}
-.zg-empty h3{margin:0 0 6px}.zg-empty p{margin:0 0 12px;font-size:13px}
-.zg-empty.small{padding:20px}
-.zg-foot{display:flex;justify-content:space-between;margin-top:18px;font-size:12px;color:var(--app-text-secondary,#9aa3b2)}
-.page-title{margin:0 0 16px}.page-title .eyebrow{font-size:12px;letter-spacing:2px;color:var(--app-accent,#7c5cff);font-weight:700}.page-title h1{margin:4px 0 6px;font-size:24px}.page-title p{margin:0;color:var(--app-text-secondary,#9aa3b2);font-size:13px}
-.glass{background:var(--app-surface,#1a1d24);border:1px solid var(--app-border,#2a2f3a);border-radius:16px}
-.zg-form{padding:18px;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
-.zg-field{display:flex;flex-direction:column;gap:6px}
-.zg-label{font-weight:600;font-size:13px}
-.zg-hint{margin:0;font-size:12px;color:var(--app-text-secondary,#9aa3b2)}
-.zg-switch{display:flex;align-items:center;gap:10px;cursor:pointer}
-.zg-switch input{display:none}
-.zg-switch .slider{width:42px;height:24px;border-radius:999px;background:var(--app-border,#2a2f3a);position:relative;transition:.15s;flex:none}
-.zg-switch .slider::after{content:"";position:absolute;top:3px;left:3px;width:18px;height:18px;border-radius:50%;background:#fff;transition:.15s}
-.zg-switch input:checked+.slider{background:var(--app-accent,#7c5cff)}
-.zg-switch input:checked+.slider::after{transform:translateX(18px)}
-.switch-label{font-weight:600;font-size:14px}
-.zg-feeds{display:flex;flex-wrap:wrap;gap:12px}
-.zg-check{display:flex;align-items:center;gap:6px;cursor:pointer;font-size:13px}
-.zg-actions{display:flex;gap:12px;margin-top:16px}
-.zg-lib .zg-grid,.zg-act .zg-grid{margin-top:14px}
-.zg-sub{margin:18px 0 8px;font-size:15px}
-.zg-logs{padding:12px 14px;max-height:320px;overflow:auto}
-.log-item{display:flex;gap:12px;padding:6px 0;border-bottom:1px solid var(--app-border,#2a2f3a);font-size:13px}
-.log-time{color:var(--app-text-secondary,#9aa3b2);flex:none;font-variant-numeric:tabular-nums}
-.log-item.warn .log-msg{color:#ffcf8a}
-.zg-runs{padding:10px 14px}
-.run-item{display:flex;align-items:center;gap:12px;padding:8px 0;border-bottom:1px solid var(--app-border,#2a2f3a);font-size:13px}
-.run-title{flex:1}.run-status{flex:none;padding:2px 8px;border-radius:999px;background:rgba(124,92,255,.16);color:#c9bcff;font-size:12px}
-.run-status.failed{background:rgba(255,90,90,.16);color:#ff8a8a}
-.run-status.attention_required{background:rgba(255,190,90,.16);color:#ffcf8a}
-.zg-dialog{position:fixed;inset:0;background:rgba(0,0,0,.6);backdrop-filter:blur(4px);display:flex;align-items:center;justify-content:center;padding:20px;z-index:50}
-.zg-dialog-back{position:absolute;inset:0}
-.zg-dialog-card{position:relative;width:min(480px,100%);max-height:86vh;overflow:auto;padding:22px;background:var(--app-surface,#1a1d24);border:1px solid var(--app-border,#2a2f3a);border-radius:18px}
-.zg-close{position:absolute;top:12px;right:12px;width:30px;height:30px;border:none;border-radius:50%;background:rgba(255,255,255,.1);color:#fff;font-size:15px;cursor:pointer}
-.dlg-top{display:flex;gap:16px;margin-bottom:14px}
-.dlg-top .poster{flex:none;width:110px}
-.dlg-top h2{margin:0;font-size:18px}.dlg-top p{margin:4px 0 0;color:var(--app-text-secondary,#9aa3b2);font-size:13px}
-.dlg-notice{color:#ffcf8a;font-size:13px}
-.zg-cands{display:flex;flex-direction:column;gap:8px;margin-top:6px}
-.cand{display:flex;align-items:center;gap:10px;padding:10px 12px;text-align:left;font:inherit;color:inherit;background:var(--app-bg,#0f1115);border:1px solid var(--app-border,#2a2f3a);border-radius:10px;cursor:pointer}
-.cand:hover{border-color:var(--app-accent,#7c5cff)}
-.cand.picked{border-color:var(--app-accent,#7c5cff);box-shadow:0 0 0 2px var(--app-accent,#7c5cff)}
-.cand-year{color:var(--app-text-secondary,#9aa3b2);font-size:12px}.cand-exact{margin-left:auto;font-size:11px;padding:2px 7px;border-radius:999px;background:rgba(62,207,142,.16);color:#7fe3b0}
+.zg-app .alert{display:flex;align-items:center;gap:10px;flex-basis:100%;padding:12px 15px;border:1px solid var(--border);border-radius:12px;background:var(--surface);font-size:12px;margin:0 0 14px;overflow-wrap:anywhere;line-height:1.6}
+.zg-app .alert.error{background:#fceced;border-color:#f0c9cc;color:var(--error)}
+.zg-app .alert.warn{background:#fdf4e6;border-color:#eddcbf;color:var(--warm)}
+.zg-app[data-theme=dark] .alert.error{background:#3a2325;border-color:#5c3134}
+.zg-app[data-theme=dark] .alert.warn{background:#3a3226;border-color:#5c4a31}
+.zg-app .zg-toast{position:fixed;bottom:26px;left:50%;transform:translateX(-50%);z-index:60;display:flex;align-items:center;gap:8px;max-width:calc(100vw - 40px);padding:13px 22px;border-radius:99px;background:var(--surface);border:1px solid var(--glass-edge);box-shadow:0 18px 50px -24px #223c3366;color:var(--accent);font-size:12px;font-weight:600}
+.zg-app .zg-toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:14px;margin:0 0 22px}
+.zg-app .zg-chips{display:flex;flex-wrap:wrap;align-items:center;gap:3px;padding:5px;border-radius:16px;background:var(--glass);border:1px solid var(--glass-edge);box-shadow:var(--shadow);backdrop-filter:blur(20px)}
+.zg-app .zg-chip{display:inline-flex;align-items:center;min-height:34px;padding:0 13px;border:0;border-radius:12px;background:transparent;color:var(--muted);font:inherit;font-size:12px;font-weight:600;cursor:pointer;transition:background .15s,color .15s}
+.zg-app .zg-chip:hover{color:var(--text)}
+.zg-app .zg-chip.selected{background:var(--accent-soft);color:var(--accent)}
+.zg-app .src-dot{display:inline-block;width:5px;height:5px;border-radius:50%;margin-right:6px;vertical-align:middle}
+.zg-app .src-dot.green{background:#2f9e7f}.zg-app .src-dot.pink{background:#d3809f}
+.zg-app .zg-search{display:flex;align-items:center;gap:8px;flex:1;min-width:200px;max-width:340px}
+.zg-app .zg-input{width:100%;min-height:44px;padding:0 14px;border:1px solid var(--border);border-radius:13px;background:var(--surface);color:var(--text);font:inherit;font-size:13px;outline:none;transition:border-color .15s,box-shadow .15s}
+.zg-app .zg-input:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.zg-app .zg-select{min-height:44px;padding:0 12px;border:1px solid var(--border);border-radius:13px;background:var(--surface);color:var(--text);font:inherit;font-size:13px;outline:none;cursor:pointer}
+.zg-app .zg-go{display:inline-flex;align-items:center;justify-content:center;min-height:44px;padding:0 18px;border:1px solid transparent;border-radius:13px;background:var(--accent);color:#fff;font:inherit;font-size:12px;font-weight:600;cursor:pointer}
+.zg-app .zg-go:disabled{opacity:.55;cursor:default}
+.zg-app .zg-bulk{display:flex;flex-wrap:wrap;align-items:center;gap:14px;margin:0 0 22px;padding:10px 14px;border-radius:16px;background:var(--glass);border:1px solid var(--glass-edge);box-shadow:var(--shadow);backdrop-filter:blur(20px)}
+.zg-app .zg-checkall{display:inline-flex;align-items:center;gap:7px;font-size:12px;color:var(--muted);cursor:pointer}
+.zg-app input[type=checkbox]{accent-color:var(--accent);width:15px;height:15px;cursor:pointer;margin:0}
+.zg-app .zg-btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;min-height:42px;padding:10px 16px;border:1px solid var(--border);border-radius:12px;background:var(--glass);color:var(--text);font:inherit;font-size:12px;font-weight:600;cursor:pointer;transition:.15s;white-space:nowrap}
+.zg-app .zg-btn:hover{border-color:var(--accent);color:var(--accent)}
+.zg-app .zg-btn.primary{background:var(--accent);border-color:transparent;color:#fff;box-shadow:0 10px 22px -14px #0d7569}
+.zg-app .zg-btn.primary:hover{color:#fff;filter:brightness(1.06)}
+.zg-app[data-theme=dark] .zg-btn.primary{color:#0e1a18}
+.zg-app .zg-btn.small{min-height:32px;padding:6px 12px;font-size:11px}
+.zg-app .zg-btn.danger{background:#b8404a;border-color:transparent;color:#fff}
+.zg-app .zg-btn:disabled{opacity:.55;cursor:default}
+.zg-app .zg-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(152px,1fr));gap:27px 21px}
+.zg-app .zg-more{display:flex;justify-content:center;margin:26px 0 0}
+.zg-app .media-card{position:relative;min-width:0}
+.zg-app .poster-btn{display:block;width:100%;padding:0;border:0;background:none;cursor:pointer;text-align:left;color:inherit;font:inherit}
+.zg-app .poster{position:relative;width:100%;aspect-ratio:2/3;border-radius:13px;overflow:hidden;background:var(--accent-soft);box-shadow:0 5px 14px -8px #344d4260;display:flex;align-items:center;justify-content:center;transition:transform .18s,box-shadow .18s}
+.zg-app .media-card:hover .poster{transform:translateY(-3px);box-shadow:0 16px 28px -16px #344d4290}
+.zg-app .media-card.selected .poster{box-shadow:0 0 0 2px var(--accent),0 14px 26px -16px #344d4290}
+.zg-app .poster-img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:0;transition:opacity .25s}
+.zg-app .poster-img.ready{opacity:1}
+.zg-app .poster-fallback{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:9px;padding:14px;text-align:center;color:var(--muted);font-size:11px;line-height:1.5}
+.zg-app .poster-fallback.hidden{display:none}
+.zg-app .card-check{position:absolute;top:9px;left:9px;z-index:3;width:24px;height:24px;border-radius:7px;background:#ffffffd9;backdrop-filter:blur(10px);display:grid;place-items:center;box-shadow:0 2px 6px #223c3320}
+.zg-app .card-plus{position:absolute;bottom:10px;right:10px;z-index:3;width:31px;height:31px;display:grid;place-items:center;border:1px solid #ffffff80;border-radius:50%;background:#ffffffc9;backdrop-filter:blur(16px);color:#1b5244;font-size:15px;line-height:1;cursor:pointer;box-shadow:0 3px 10px #223c3326}
+.zg-app .card-plus:hover{background:#fff}
+.zg-app .card-meta{padding-top:11px}
+.zg-app .card-meta h3{margin:0;font-size:12.5px;font-weight:600;line-height:1.35;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.zg-app .card-meta p{margin:4px 0 0;font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.zg-app .card-meta p.sub{color:#2f9e7f}
+.zg-app .card-meta p.err{color:var(--error)}
+.zg-app .card-tags{display:flex;flex-wrap:wrap;align-items:center;gap:5px;margin-top:7px}
+.zg-app .src-tag{font-size:9px;font-weight:600;padding:3px 7px;border-radius:6px;background:var(--accent-soft);color:var(--accent)}
+.zg-app .src-tag.bangumi{background:#fdeef4;color:#a34a72}
+.zg-app[data-theme=dark] .src-tag.bangumi{background:#3d2a33;color:#f0a9c8}
+.zg-app .score{font-size:11px;font-weight:600;color:var(--warm)}
+.zg-app .badge{font-size:9px;font-weight:600;padding:3px 7px;border-radius:6px;background:var(--accent-soft);color:var(--accent)}
+.zg-app .zg-empty{grid-column:1/-1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:13px;min-height:280px;padding:40px 18px;text-align:center;color:var(--muted)}
+.zg-app .zg-empty h3{margin:0;font-size:15px;font-weight:600;color:var(--text)}
+.zg-app .zg-empty p{margin:0;font-size:12px}
+.zg-app .zg-empty.small{min-height:0;padding:20px;font-size:12px}
+.zg-app .zg-foot{display:flex;justify-content:space-between;gap:14px;margin-top:26px;font-size:11px;color:var(--muted)}
+.zg-app .page-title{padding:26px 0 30px}
+.zg-app .page-title .eyebrow{display:flex;align-items:center;gap:8px;font-size:9px;font-weight:650;letter-spacing:2px;color:var(--accent);text-transform:uppercase}
+.zg-app .page-title h1{margin:7px 0 7px;font-size:26px;font-weight:650;letter-spacing:-.5px}
+.zg-app .page-title p{margin:0;font-size:12px;color:var(--muted)}
+.zg-app .zg-form{padding:27px;border-radius:22px;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 24px}
+.zg-app .zg-field{display:flex;flex-direction:column;gap:8px;margin-bottom:19px;font-size:12px;min-width:0}
+.zg-app .zg-field.invalid .zg-input,.zg-app .zg-field.invalid .zg-select{border-color:var(--error);box-shadow:0 0 0 3px #fbe3e4}
+.zg-app .zg-label{font-size:11px;font-weight:600;color:var(--muted);letter-spacing:.2px}
+.zg-app .zg-hint{margin:0;font-size:11px;line-height:1.55;color:var(--muted);opacity:.9}
+.zg-app .zg-err{margin:0;font-size:11px;font-weight:600;color:var(--error)}
+.zg-app .zg-switch{display:inline-flex;align-items:center;gap:10px;cursor:pointer;min-height:24px}
+.zg-app .zg-switch input{display:none}
+.zg-app .zg-switch .slider{position:relative;width:44px;height:25px;border-radius:99px;background:var(--border);transition:background .16s;flex:none}
+.zg-app .zg-switch .slider::after{content:"";position:absolute;top:3px;left:3px;width:19px;height:19px;border-radius:50%;background:#fff;box-shadow:0 1px 3px #223c3350;transition:transform .16s}
+.zg-app .zg-switch input:checked+.slider{background:var(--accent)}
+.zg-app .zg-switch input:checked+.slider::after{transform:translateX(19px)}
+.zg-app .switch-label{font-size:12px;font-weight:600}
+.zg-app .zg-feeds{display:flex;flex-wrap:wrap;gap:8px}
+.zg-app .zg-check{display:inline-flex;align-items:center;gap:7px;padding:8px 12px;border:1px solid var(--border);border-radius:10px;background:var(--surface);font-size:12px;cursor:pointer}
+.zg-app .zg-check:hover{border-color:var(--accent)}
+.zg-app .zg-actions{display:flex;flex-wrap:wrap;gap:12px;margin-top:18px}
+.zg-app .zg-sub{margin:26px 0 12px;font-size:13px;font-weight:650;letter-spacing:.2px}
+.zg-app .zg-logs{padding:4px 18px;border-radius:18px;max-height:340px;overflow:auto}
+.zg-app .log-item{display:flex;gap:14px;padding:11px 0;border-bottom:1px solid var(--border);font-size:12px;line-height:1.55}
+.zg-app .log-item:last-child{border-bottom:0}
+.zg-app .log-time{flex:none;color:var(--muted);font-variant-numeric:tabular-nums;font-size:11px}
+.zg-app .log-msg{min-width:0;overflow-wrap:anywhere}
+.zg-app .log-item.warn .log-msg{color:var(--warm)}
+.zg-app .zg-runs{padding:4px 18px;border-radius:18px}
+.zg-app .run-item{display:flex;align-items:center;gap:12px;padding:11px 0;border-bottom:1px solid var(--border);font-size:12px}
+.zg-app .run-item:last-child{border-bottom:0}
+.zg-app .run-title{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}
+.zg-app .run-title b{font-size:12px;font-weight:600;letter-spacing:.2px}
+.zg-app .run-sub{font-size:11px;font-weight:400;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.zg-app .run-status{flex:none;padding:3px 9px;border-radius:99px;background:var(--accent-soft);color:var(--accent);font-size:10px;font-weight:600}
+.zg-app .run-status.failed{background:#fce8e9;color:var(--error)}
+.zg-app .run-status.attention_required{background:#fdf2e2;color:var(--warm)}
+.zg-app[data-theme=dark] .run-status.failed{background:#3a2325}
+.zg-app[data-theme=dark] .run-status.attention_required{background:#3a3226}
+.zg-app .zg-dialog{position:fixed;inset:0;z-index:50;display:flex;align-items:center;justify-content:center;padding:20px;background:#203b3926;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.zg-app[data-theme=dark] .zg-dialog{background:#0006}
+.zg-app .zg-dialog-back{position:absolute;inset:0}
+.zg-app .zg-dialog-card{position:relative;width:min(680px,100%);max-height:85vh;overflow:auto;overscroll-behavior:contain;padding:27px;border-radius:25px;background:var(--surface);border:1px solid var(--glass-edge);box-shadow:0 30px 80px -40px #223c3370}
+.zg-app .zg-close{position:absolute;top:16px;right:16px;width:32px;height:32px;border:1px solid var(--border);border-radius:50%;background:var(--surface);color:var(--muted);font-size:14px;line-height:1;cursor:pointer}
+.zg-app .zg-close:hover{color:var(--text);border-color:var(--accent)}
+.zg-app .dlg-top{display:flex;gap:18px;margin:0 0 16px}
+.zg-app .dlg-top .poster{flex:none;width:104px;border-radius:12px}
+.zg-app .dlg-top h2{margin:0 0 4px;font-size:19px;font-weight:650;letter-spacing:-.3px;padding-right:24px}
+.zg-app .dlg-top p{margin:0 0 6px;font-size:12px;color:var(--muted);line-height:1.6}
+.zg-app .dlg-notice{display:block;margin:8px 0 0;font-size:11px;color:var(--warm)}
+.zg-app .zg-cands{display:flex;flex-direction:column;gap:8px;margin:12px 0 0}
+.zg-app .cand{display:flex;align-items:center;gap:10px;width:100%;padding:11px 13px;border:1px solid var(--border);border-radius:12px;background:var(--surface);color:var(--text);font:inherit;font-size:12px;text-align:left;cursor:pointer}
+.zg-app .cand:hover{border-color:var(--accent)}
+.zg-app .cand.picked{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-soft)}
+.zg-app .cand-year{color:var(--muted);font-size:11px}
+.zg-app .cand-exact{margin-left:auto;font-size:9px;font-weight:600;padding:3px 7px;border-radius:6px;background:var(--accent-soft);color:var(--accent)}
 `;
 
 function iconGlyph(name){

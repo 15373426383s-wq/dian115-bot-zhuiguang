@@ -21,7 +21,7 @@ export async function run(ctx,input={}){
   if(input.action==='stop')return stopSubscription(ctx,input.key);
   const synced=await reconcile(ctx);
   let pool=synced; // 本轮回传的订阅池快照；新建意图会并入，避免同轮内同 identity 重复创建
-  if(input.action==='sync')return {synced:true};
+  if(input.action==='sync'){ await change(ctx,x=>{x.lastSync=Date.now();addLog(x,'已核对宿主订阅状态');}); return {synced:true}; }
   if(input.action==='auto')return discover(ctx,pool,{force:true}); // 立即追新：手动触发，跳过间隔门控
   return discover(ctx,pool,{force:false}); // 周期运行（保留间隔门控）
   }finally{
